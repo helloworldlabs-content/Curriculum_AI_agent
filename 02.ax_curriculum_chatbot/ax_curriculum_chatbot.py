@@ -16,7 +16,7 @@ import os
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
+ 
 SYSTEM_PROMPT = """당신은 20년 경력의 IT·AI 교육 전문가이자 교육 스타트업 대표입니다.
 
 [전문 분야]
