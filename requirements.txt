@@ -4,6 +4,12 @@ chromadb
 streamlit
 requests
 
+# LangChain
+langchain
+langchain-openai
+langchain-chroma
+langchain-core
+
 # 백엔드 (Docker)
 fastapi
 uvicorn
