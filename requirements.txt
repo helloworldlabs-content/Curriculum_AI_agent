@@ -2,3 +2,10 @@ openai
 pygame
 chromadb
 streamlit
+requests
+
+# 백엔드 (Docker)
+fastapi
+uvicorn
+gunicorn
+pydantic
