@@ -1,23 +1,11 @@
 import re
-import json
-import os
-import base64
-from textwrap import dedent
+import requests
 
 import streamlit as st
-import chromadb
-from chromadb.utils import embedding_functions
-from openai import OpenAI
 
 st.set_page_config(page_title="AI 커리큘럼 설계", page_icon="◼", layout="wide")
 
-# --- 경로 및 상수 ---
-
-BASE_DIR        = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
-PDF_CACHE_PATH  = os.path.join(BASE_DIR, "Data", "ax_compass_full.txt")
-VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
-COLLECTION_NAME = "ax_compass_types"
+# --- 상수 ---
 
 STAGE_GREETING     = "greeting"
 STAGE_REQUIREMENTS = "requirements"
@@ -36,35 +24,6 @@ REQUIREMENT_FIELDS = [
 ]
 
 TYPE_FIELDS = ["균형형", "이해형", "과신형", "실행형", "판단형", "조심형"]
-
-TYPE_INFO = {
-    "균형형": {"group": "A", "english": "BALANCED"},
-    "이해형": {"group": "A", "english": "LEARNER"},
-    "과신형": {"group": "B", "english": "OVERCONFIDENT"},
-    "실행형": {"group": "B", "english": "DOER"},
-    "판단형": {"group": "C", "english": "ANALYST"},
-    "조심형": {"group": "C", "english": "CAUTIOUS"},
-}
-
-TYPE_MARKERS = {
-    "균형형": "## 1) 균형형",
-    "실행형": "## 2) 실행형",
-    "판단형": "## 3) 판단형",
-    "이해형": "## 4) 이해형",
-    "과신형": "## 5) 과신형",
-    "조심형": "## 6) 조심형",
-}
-
-_SESSION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title":      {"type": "string"},
-        "goals":      {"type": "array", "items": {"type": "string"}},
-        "activities": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["title", "goals", "activities"],
-    "additionalProperties": False,
-}
 
 # --- CSS ---
 
@@ -161,176 +120,33 @@ def apply_custom_css():
     """, unsafe_allow_html=True)
 
 
-# --- 환경 설정 ---
+# --- 백엔드 API ---
 
-def load_env_file():
-    env_path = os.path.join(BASE_DIR, ".env")
-    if not os.path.exists(env_path):
-        return
-    with open(env_path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key and key not in os.environ:
-                os.environ[key] = value
+def _backend_headers() -> dict:
+    return {"X-API-Key": st.secrets["BACKEND_API_KEY"]}
+
+def _backend_url(path: str) -> str:
+    return st.secrets["BACKEND_URL"].rstrip("/") + path
 
 
-# --- RAG ---
+@st.cache_data(ttl=30)
+def check_backend_health() -> dict | None:
+    try:
+        resp = requests.get(_backend_url("/health"), headers=_backend_headers(), timeout=5)
+        return resp.json() if resp.ok else None
+    except Exception:
+        return None
 
-def load_pdf_content():
-    if os.path.exists(PDF_CACHE_PATH):
-        with open(PDF_CACHE_PATH, "r", encoding="utf-8") as f:
-            return f.read()
-    if not os.path.exists(PDF_PATH):
-        raise FileNotFoundError(f"PDF 파일 없음: {PDF_PATH}")
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    with open(PDF_PATH, "rb") as f:
-        pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{"role": "user", "content": [
-            {"type": "input_file", "filename": "AXCompass.pdf",
-             "file_data": f"data:application/pdf;base64,{pdf_data}"},
-            {"type": "input_text", "text":
-             "이 PDF의 모든 내용을 한국어 마크다운으로 추출해줘. "
-             "각 유형의 강점, 보완 방향, 대표 태그를 포함하고 "
-             "각 유형 섹션은 '## 번호) 유형명' 형식으로 시작해줘."},
-        ]}]
+
+def generate_curriculum(requirements: dict, groups: dict) -> dict:
+    resp = requests.post(
+        _backend_url("/generate"),
+        json={"requirements": requirements, "groups": groups},
+        headers=_backend_headers(),
+        timeout=180,
     )
-    content = response.output_text
-    os.makedirs(os.path.dirname(PDF_CACHE_PATH), exist_ok=True)
-    with open(PDF_CACHE_PATH, "w", encoding="utf-8") as f:
-        f.write(content)
-    return content
-
-
-def extract_type_chunks(pdf_content):
-    chunks = []
-    for type_name, marker in TYPE_MARKERS.items():
-        start = pdf_content.find(marker)
-        if start == -1:
-            continue
-        end = min(
-            (pdf_content.find(om, start + len(marker))
-             for om in TYPE_MARKERS.values() if om != marker
-             if pdf_content.find(om, start + len(marker)) != -1),
-            default=len(pdf_content),
-        )
-        info = TYPE_INFO[type_name]
-        chunks.append({
-            "id": type_name,
-            "text": pdf_content[start:end].strip(),
-            "metadata": {"type_name": type_name, "group": info["group"], "english": info["english"]},
-        })
-    return chunks
-
-
-@st.cache_resource
-def get_collection():
-    load_env_file()
-    chroma_client = chromadb.PersistentClient(path=VECTOR_DB_PATH)
-    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-        api_key=os.getenv("OPENAI_API_KEY"), model_name="text-embedding-3-small"
-    )
-    collection = chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME, embedding_function=openai_ef,
-        metadata={"hnsw:space": "cosine"},
-    )
-    if collection.count() == 0:
-        chunks = extract_type_chunks(load_pdf_content())
-        collection.add(
-            documents=[c["text"] for c in chunks],
-            metadatas=[c["metadata"] for c in chunks],
-            ids=[c["id"] for c in chunks],
-        )
-    return collection
-
-
-def retrieve_type_context(collection, type_names):
-    query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
-    results = collection.query(
-        query_texts=[query], n_results=len(type_names),
-        where={"type_name": {"$in": list(type_names)}},
-        include=["documents"],
-    )
-    return "\n\n".join(results["documents"][0])
-
-
-def generate_curriculum(requirements, groups, collection):
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
-    ctxs = {
-        "a": retrieve_type_context(collection, ga["types"]),
-        "b": retrieve_type_context(collection, gb["types"]),
-        "c": retrieve_type_context(collection, gc["types"]),
-    }
-
-    system_prompt = dedent("""
-        당신은 기업 교육용 AI 커리큘럼 설계 전문가다.
-        AX Compass 진단 결과와 유형별 특성을 바탕으로 맞춤형 교육 커리큘럼을 설계하라.
-        - theory_sessions: 공통 이론 수업 4~6개
-        - group_sessions: 3개 그룹별 실습 각 2~3개
-        JSON만 반환. 마크다운 코드블록 없음.
-    """).strip()
-
-    req = requirements
-    user_prompt = dedent(f"""
-        [기업 요구사항]
-        회사/팀: {req['company_name']} | 목표: {req['goal']}
-        대상자: {req['audience']} | 수준: {req['level']}
-        기간: {req['duration']} | 주제: {req['topic']}
-        제한사항: {req['constraints']}
-
-        [그룹 구성]
-        - {ga['name']} ({' · '.join(ga['types'])}): {ga['count']}명
-        - {gb['name']} ({' · '.join(gb['types'])}): {gb['count']}명
-        - {gc['name']} ({' · '.join(gc['types'])}): {gc['count']}명
-
-        [AX Compass 유형 특성]
-        그룹 A: {ctxs['a']}
-        그룹 B: {ctxs['b']}
-        그룹 C: {ctxs['c']}
-    """).strip()
-
-    schema = {
-        "type": "json_schema", "name": "curriculum_plan_rag", "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "program_title":    {"type": "string"},
-                "target_summary":   {"type": "string"},
-                "theory_sessions":  {"type": "array", "items": _SESSION_SCHEMA},
-                "group_sessions": {"type": "array", "items": {
-                    "type": "object",
-                    "properties": {
-                        "group_name":        {"type": "string"},
-                        "target_types":      {"type": "string"},
-                        "participant_count": {"type": "integer"},
-                        "focus_description": {"type": "string"},
-                        "sessions":          {"type": "array", "items": _SESSION_SCHEMA},
-                    },
-                    "required": ["group_name", "target_types", "participant_count", "focus_description", "sessions"],
-                    "additionalProperties": False,
-                }},
-                "expected_outcomes": {"type": "array", "items": {"type": "string"}},
-                "notes":             {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["program_title", "target_summary", "theory_sessions",
-                         "group_sessions", "expected_outcomes", "notes"],
-            "additionalProperties": False,
-        },
-    }
-
-    response = client.responses.create(
-        model="gpt-4.1-mini", text={"format": schema},
-        input=[{"role": "developer", "content": system_prompt},
-               {"role": "user", "content": user_prompt}],
-    )
-    return json.loads(response.output_text.strip())
+    resp.raise_for_status()
+    return resp.json()
 
 
 # --- 세션 상태 ---
@@ -541,12 +357,7 @@ def render_sidebar():
         steps_html = ""
         for i, (s_stage, s_label) in enumerate(stage_labels, 1):
             s_idx = stage_order.index(s_stage)
-            if s_idx < cur_idx:
-                cls = "done"
-            elif s_idx == cur_idx:
-                cls = "current"
-            else:
-                cls = "todo"
+            cls = "done" if s_idx < cur_idx else ("current" if s_idx == cur_idx else "todo")
             steps_html += (f'<div class="step-item step-dot-{cls}">'
                            f'<div class="step-num step-num-{cls}">{i}</div>'
                            f'<span>{s_label}</span></div>')
@@ -558,18 +369,17 @@ def render_sidebar():
             st.rerun()
 
         st.markdown('<hr style="border-color:#333;margin:16px 0;">', unsafe_allow_html=True)
-        st.markdown('<div style="font-size:11px;color:#777;letter-spacing:1px;margin-bottom:8px;">VECTOR DB</div>', unsafe_allow_html=True)
-        try:
-            col = get_collection()
-            st.markdown(f'<div style="color:#aaaaaa;font-size:13px;">✓ {col.count()}개 유형 로드됨</div>', unsafe_allow_html=True)
-        except Exception as e:
-            st.markdown(f'<div style="color:#ff6666;font-size:13px;">✗ {e}</div>', unsafe_allow_html=True)
+        st.markdown('<div style="font-size:11px;color:#777;letter-spacing:1px;margin-bottom:8px;">BACKEND</div>', unsafe_allow_html=True)
+        health = check_backend_health()
+        if health:
+            st.markdown(f'<div style="color:#aaaaaa;font-size:13px;">✓ 연결됨 ({health["chunks"]}개 유형)</div>', unsafe_allow_html=True)
+        else:
+            st.markdown('<div style="color:#ff6666;font-size:13px;">✗ 백엔드 연결 실패</div>', unsafe_allow_html=True)
 
 
 # --- 메인 ---
 
 def main():
-    load_env_file()
     apply_custom_css()
     init_session_state()
     render_sidebar()
@@ -598,15 +408,17 @@ def main():
     if st.session_state.generating:
         st.session_state.generating = False
         try:
-            collection = get_collection()
-            with st.spinner("벡터 DB 검색 및 커리큘럼 생성 중..."):
+            with st.spinner("백엔드 서버에서 커리큘럼 생성 중..."):
                 curriculum = generate_curriculum(
                     st.session_state.requirements,
                     st.session_state.groups,
-                    collection,
                 )
             st.session_state.curriculum = curriculum
             add_msg("assistant", f"✅ **{curriculum['program_title']}** 생성 완료!\n\n아래에서 전체 커리큘럼을 확인하세요.")
+        except requests.HTTPError as e:
+            add_msg("assistant", f"❌ 백엔드 오류 ({e.response.status_code}): {e.response.text}")
+        except requests.ConnectionError:
+            add_msg("assistant", "❌ 백엔드 서버에 연결할 수 없습니다. ngrok 및 Docker 상태를 확인해주세요.")
         except Exception as e:
             add_msg("assistant", f"❌ 오류: {e}")
         st.rerun()
