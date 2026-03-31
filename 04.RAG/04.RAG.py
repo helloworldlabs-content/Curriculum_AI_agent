@@ -2,7 +2,7 @@ import os
 from textwrap import dedent
 
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader, UnstructuredPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -118,7 +118,7 @@ def load_and_split_documents() -> list:
             fpath = os.path.join(DATA_DIR, fname)
             print(f"[RAG] 커리큘럼 PDF 로드: {fname}")
             course_name = os.path.splitext(fname)[0]
-            pages = UnstructuredPDFLoader(fpath).load()
+            pages = PyPDFLoader(fpath).load()
             for page in pages:
                 page.metadata.update({"doc_type": "curriculum_example", "course_name": course_name})
             all_docs.extend(pages)
@@ -186,21 +186,29 @@ def setup_vector_store() -> Chroma:
 
 def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
-    docs = vectorstore.similarity_search(
-        query, k=len(type_names),
-        filter={"$and": [
-            {"doc_type":  {"$eq": "ax_compass"}},
-            {"type_name": {"$in": type_names}},
-        ]},
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": len(type_names),
+            "filter": {"$and": [
+                {"doc_type":  {"$eq": "ax_compass"}},
+                {"type_name": {"$in": type_names}},
+            ]},
+        },
     )
+    docs = retriever.invoke(query)
     return "\n\n".join(d.page_content for d in docs)
 
 
 def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
-    docs = vectorstore.similarity_search(
-        query, k=k,
-        filter={"doc_type": {"$eq": "curriculum_example"}},
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": k,
+            "filter": {"doc_type": {"$eq": "curriculum_example"}},
+        },
     )
+    docs = retriever.invoke(query)
     return "\n\n---\n\n".join(d.page_content for d in docs)
 
 
@@ -223,6 +231,10 @@ GENERATION_SYSTEM_PROMPT = dedent("""
        - theory_sessions 합계 + 그룹 실습 합계(1개 그룹 기준) = 총 교육 시간
     4. 기업 교육답게 실무 적용 중심으로 구성한다.
     5. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
+    6. [커리큘럼 예시 참고 자료]가 제공되는 경우, 아래 기준으로 참고하되 내용을 그대로 복사하지 마라:
+       - 세션 제목과 구성 방식 (이론→실습 흐름, 주제 전개 순서 등)
+       - 활동 유형 (워크숍, 실습, 토론, 케이스 스터디 등)
+       - 강의 내용의 깊이와 수준 (용어, 난이도, 현업 적용 방식)
 """).strip()
 
 
@@ -283,7 +295,7 @@ def build_chain(vectorstore: Chroma):
             === 그룹 C ({' · '.join(gc['types'])}) ===
             {ctx_c}
 
-            [커리큘럼 예시 참고 자료]
+            [커리큘럼 예시 참고 자료 — 세션 구성 방식·활동 유형·강의 내용 수준을 참고할 것]
             {curriculum_examples}
         """).strip()
 
