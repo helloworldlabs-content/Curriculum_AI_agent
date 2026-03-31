@@ -30,6 +30,19 @@ TYPE_INFO = {
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
 
+SECTION_MARKERS = {
+    "강점":   ["강점", "장점"],
+    "보완방향": ["보완 방향", "보완방향", "보완"],
+    "대표태그": ["대표 태그", "태그"],
+}
+
+
+def detect_section_type(text: str) -> str:
+    for section, keywords in SECTION_MARKERS.items():
+        if any(kw in text for kw in keywords):
+            return section
+    return "일반"
+
 COLLECTION_SYSTEM_PROMPT = dedent("""
     당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 어시스턴트다.
     아래 항목을 자연스러운 대화로 한 번에 1개씩 순서대로 수집해라.
@@ -165,9 +178,9 @@ def load_and_split_documents() -> list:
     pages = PyPDFLoader(PDF_PATH).load()
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=500,
+        chunk_size=300,
         chunk_overlap=50,
-        separators=["\n\n", "\n", " "],
+        separators=["\n\n", "\n", ". ", " "],
     )
     chunks = splitter.split_documents(pages)
 
@@ -175,9 +188,10 @@ def load_and_split_documents() -> list:
         for type_name, info in TYPE_INFO.items():
             if type_name in chunk.page_content:
                 chunk.metadata.update({
-                    "type_name": type_name,
-                    "group": info["group"],
-                    "english": info["english"],
+                    "type_name":    type_name,
+                    "group":        info["group"],
+                    "english":      info["english"],
+                    "section_type": detect_section_type(chunk.page_content),
                 })
                 break
 
