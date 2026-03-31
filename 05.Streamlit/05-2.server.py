@@ -219,13 +219,24 @@ def init_vector_store() -> Chroma:
     return vectorstore
 
 
-def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
-    query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
+def retrieve_section(vectorstore: Chroma, type_names: list[str], section_type: str, query: str) -> str:
     docs = vectorstore.similarity_search(
-        query, k=len(type_names),
-        filter={"type_name": {"$in": type_names}},
+        query,
+        k=len(type_names) * 2,
+        filter={"$and": [
+            {"type_name":    {"$in": type_names}},
+            {"section_type": section_type},
+        ]},
     )
-    return "\n\n".join(d.page_content for d in docs)
+    return "\n\n".join(d.page_content for d in docs) if docs else "(검색 결과 없음)"
+
+
+def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> dict:
+    names = ', '.join(type_names)
+    return {
+        "strengths":    retrieve_section(vectorstore, type_names, "강점",   f"{names} 유형의 강점과 AI 활용 장점"),
+        "improvements": retrieve_section(vectorstore, type_names, "보완방향", f"{names} 유형의 보완 방향과 개선점"),
+    }
 
 
 def build_generation_chain(vectorstore: Chroma):
@@ -247,6 +258,16 @@ def build_generation_chain(vectorstore: Chroma):
 
         chat_history = [m for m in conversation if not isinstance(m, SystemMessage)]
 
+        def group_ctx_block(name, types, ctx):
+            return dedent(f"""
+                === {name} ({' · '.join(types)}) ===
+                [강점]
+                {ctx['strengths']}
+
+                [보완방향]
+                {ctx['improvements']}
+            """).strip()
+
         rag_content = dedent(f"""
             위 대화에서 수집한 요구사항을 바탕으로 맞춤형 교육 커리큘럼을 설계해줘.
 
@@ -262,14 +283,11 @@ def build_generation_chain(vectorstore: Chroma):
             - {gc['name']} ({' · '.join(gc['types'])}): {gc['count']}명
 
             [AX Compass 유형별 특성 — 벡터 DB 검색 결과]
-            === 그룹 A ({' · '.join(ga['types'])}) ===
-            {ctx_a}
+            {group_ctx_block(ga['name'], ga['types'], ctx_a)}
 
-            === 그룹 B ({' · '.join(gb['types'])}) ===
-            {ctx_b}
+            {group_ctx_block(gb['name'], gb['types'], ctx_b)}
 
-            === 그룹 C ({' · '.join(gc['types'])}) ===
-            {ctx_c}
+            {group_ctx_block(gc['name'], gc['types'], ctx_c)}
         """).strip()
 
         return (
