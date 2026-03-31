@@ -105,8 +105,13 @@ def call_chat(messages: list[dict]) -> dict:
     return resp.json()
 
 
-def call_generate(messages: list[dict]) -> dict:
-    resp = requests.post(_url("/generate"), json={"messages": messages}, headers=_headers(), timeout=180)
+def call_generate(messages: list[dict], collected_info: dict) -> dict:
+    resp = requests.post(
+        _url("/generate"),
+        json={"messages": messages, "collected_info": collected_info},
+        headers=_headers(),
+        timeout=300,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -115,10 +120,11 @@ def call_generate(messages: list[dict]) -> dict:
 
 def init_session_state():
     defaults = {
-        "messages":   [],    # {"role": "user"|"assistant", "content": str}
-        "complete":   False, # 정보 수집 완료 여부
-        "generating": False,
-        "curriculum": None,
+        "messages":       [],
+        "collected_info": None,
+        "complete":       False,
+        "generating":     False,
+        "curriculum":     None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -276,7 +282,7 @@ def main():
         st.session_state.generating = False
         try:
             with st.spinner("커리큘럼을 생성하고 있습니다..."):
-                curriculum = call_generate(st.session_state.messages)
+                curriculum = call_generate(st.session_state.messages, st.session_state.collected_info)
             st.session_state.curriculum = curriculum
             st.session_state.messages.append({
                 "role": "assistant",
@@ -302,8 +308,9 @@ def main():
                     result = call_chat(st.session_state.messages)
                 st.session_state.messages.append({"role": "assistant", "content": result["reply"]})
                 if result["complete"]:
-                    st.session_state.complete   = True
-                    st.session_state.generating = True
+                    st.session_state.collected_info = result["collected_info"]
+                    st.session_state.complete       = True
+                    st.session_state.generating     = True
             except Exception as e:
                 st.session_state.messages.append({"role": "assistant", "content": f"❌ 오류: {e}"})
             st.rerun()
