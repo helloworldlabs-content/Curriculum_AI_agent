@@ -215,7 +215,7 @@ def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
 
 
 def build_generation_chain(vectorstore: Chroma):
-    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)
 
     def retrieve_and_build_messages(input_dict: dict) -> list:
@@ -269,7 +269,7 @@ def build_generation_chain(vectorstore: Chroma):
 
 # --- App 초기화 ---
 
-_llm        = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+_llm        = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
 _vectorstore = init_vector_store()
 _gen_chain   = build_generation_chain(_vectorstore)
 
