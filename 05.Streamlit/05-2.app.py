@@ -1,13 +1,14 @@
-import json
 import os
 import base64
 from textwrap import dedent
 
-import chromadb
-from chromadb.utils import embedding_functions
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
-from openai import OpenAI
+from langchain_chroma import Chroma
+from langchain_core.documents import Document
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel
 
 # --- Config ---
@@ -38,16 +39,51 @@ TYPE_INFO = {
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
 
-SESSION_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "title":      {"type": "string"},
-        "goals":      {"type": "array", "items": {"type": "string"}},
-        "activities": {"type": "array", "items": {"type": "string"}},
-    },
-    "required": ["title", "goals", "activities"],
-    "additionalProperties": False,
-}
+SYSTEM_PROMPT = dedent("""
+    당신은 기업 교육용 AI 커리큘럼 설계 전문가다.
+    AX Compass 진단 결과와 유형별 특성을 바탕으로 맞춤형 교육 커리큘럼을 설계하라.
+
+    커리큘럼 구조:
+    - theory_sessions: 모든 참가자가 동일하게 수강하는 공통 이론 수업. 4개 이상 6개 이하.
+    - group_sessions: 3개 그룹이 각각 다른 실습을 진행. 각 그룹당 2개 이상 3개 이하.
+
+    규칙:
+    1. 그룹별 실습은 해당 유형의 강점을 활용하고 보완 방향을 실습 활동에 녹인다.
+    2. 각 회차는 title, goals, activities를 포함한다.
+    3. 기업 교육답게 실무 적용 중심으로 구성한다.
+    4. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
+""").strip()
+
+
+# --- Pydantic 스키마 (Structured Output + API 요청) ---
+
+class Session(BaseModel):
+    title: str
+    goals: list[str]
+    activities: list[str]
+
+
+class GroupSession(BaseModel):
+    group_name: str
+    target_types: str
+    participant_count: int
+    focus_description: str
+    sessions: list[Session]
+
+
+class CurriculumPlan(BaseModel):
+    program_title: str
+    target_summary: str
+    theory_sessions: list[Session]
+    group_sessions: list[GroupSession]
+    expected_outcomes: list[str]
+    notes: list[str]
+
+
+class GenerateRequest(BaseModel):
+    requirements: dict
+    groups: dict
+
 
 # --- Auth ---
 
@@ -60,6 +96,7 @@ def verify_api_key(key: str = Security(api_key_header)) -> str:
         raise HTTPException(status_code=403, detail="Invalid API Key")
     return key
 
+
 # --- RAG Pipeline ---
 
 def load_pdf_content() -> str:
@@ -68,6 +105,7 @@ def load_pdf_content() -> str:
             return f.read()
     if not os.path.exists(PDF_PATH):
         raise FileNotFoundError(f"PDF 파일 없음: {PDF_PATH}")
+    from openai import OpenAI
     client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
     with open(PDF_PATH, "rb") as f:
         pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
@@ -89,7 +127,7 @@ def load_pdf_content() -> str:
     return content
 
 
-def extract_type_chunks(pdf_content: str) -> list:
+def extract_type_chunks(pdf_content: str) -> list[dict]:
     chunks = []
     for type_name, marker in TYPE_MARKERS.items():
         start = pdf_content.find(marker)
@@ -110,134 +148,107 @@ def extract_type_chunks(pdf_content: str) -> list:
     return chunks
 
 
-def init_collection():
-    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
-        api_key=os.getenv("OPENAI_API_KEY"), model_name="text-embedding-3-small"
+def init_vector_store() -> Chroma:
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        api_key=os.getenv("OPENAI_API_KEY"),
     )
-    chroma = chromadb.PersistentClient(path=VECTOR_DB_PATH)
-    collection = chroma.get_or_create_collection(
-        name=COLLECTION_NAME, embedding_function=openai_ef,
-        metadata={"hnsw:space": "cosine"},
+    vectorstore = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=VECTOR_DB_PATH,
     )
-    if collection.count() == 0:
+    if vectorstore._collection.count() == 0:
         print("[VectorDB] 임베딩 생성 중...")
         chunks = extract_type_chunks(load_pdf_content())
-        collection.add(
-            documents=[c["text"] for c in chunks],
-            metadatas=[c["metadata"] for c in chunks],
-            ids=[c["id"] for c in chunks],
-        )
-        print(f"[VectorDB] {len(chunks)}개 청크 저장 완료")
+        docs = [Document(page_content=c["text"], metadata=c["metadata"]) for c in chunks]
+        vectorstore.add_documents(docs, ids=[c["id"] for c in chunks])
+        print(f"[VectorDB] {len(docs)}개 청크 저장 완료")
     else:
-        print(f"[VectorDB] 기존 컬렉션 로드 완료 ({collection.count()}개 청크)")
-    return collection
+        print(f"[VectorDB] 기존 컬렉션 로드 완료 ({vectorstore._collection.count()}개 청크)")
+    return vectorstore
 
 
-def retrieve_type_context(collection, type_names: list) -> str:
+def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
-    results = collection.query(
-        query_texts=[query], n_results=len(type_names),
-        where={"type_name": {"$in": list(type_names)}},
-        include=["documents"],
+    docs = vectorstore.similarity_search(
+        query, k=len(type_names),
+        filter={"type_name": {"$in": type_names}},
     )
-    return "\n\n".join(results["documents"][0])
+    return "\n\n".join(d.page_content for d in docs)
 
 
-def run_rag(requirements: dict, groups: dict, collection) -> dict:
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
-    ctxs = {
-        "a": retrieve_type_context(collection, ga["types"]),
-        "b": retrieve_type_context(collection, gb["types"]),
-        "c": retrieve_type_context(collection, gc["types"]),
-    }
-
-    system_prompt = dedent("""
-        당신은 기업 교육용 AI 커리큘럼 설계 전문가다.
-        AX Compass 진단 결과와 유형별 특성을 바탕으로 맞춤형 교육 커리큘럼을 설계하라.
-        - theory_sessions: 공통 이론 수업 4~6개
-        - group_sessions: 3개 그룹별 실습 각 2~3개
-        JSON만 반환. 마크다운 코드블록 없음.
-    """).strip()
-
-    user_prompt = dedent(f"""
-        [기업 요구사항]
-        회사/팀: {requirements['company_name']} | 목표: {requirements['goal']}
-        대상자: {requirements['audience']} | 수준: {requirements['level']}
-        기간: {requirements['duration']} | 주제: {requirements['topic']}
-        제한사항: {requirements['constraints']}
-
-        [그룹 구성]
-        - {ga['name']} ({' · '.join(ga['types'])}): {ga['count']}명
-        - {gb['name']} ({' · '.join(gb['types'])}): {gb['count']}명
-        - {gc['name']} ({' · '.join(gc['types'])}): {gc['count']}명
-
-        [AX Compass 유형 특성]
-        그룹 A: {ctxs['a']}
-        그룹 B: {ctxs['b']}
-        그룹 C: {ctxs['c']}
-    """).strip()
-
-    schema = {
-        "type": "json_schema", "name": "curriculum_plan_rag", "strict": True,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "program_title":     {"type": "string"},
-                "target_summary":    {"type": "string"},
-                "theory_sessions":   {"type": "array", "items": SESSION_SCHEMA},
-                "group_sessions": {"type": "array", "items": {
-                    "type": "object",
-                    "properties": {
-                        "group_name":        {"type": "string"},
-                        "target_types":      {"type": "string"},
-                        "participant_count": {"type": "integer"},
-                        "focus_description": {"type": "string"},
-                        "sessions":          {"type": "array", "items": SESSION_SCHEMA},
-                    },
-                    "required": ["group_name", "target_types", "participant_count",
-                                 "focus_description", "sessions"],
-                    "additionalProperties": False,
-                }},
-                "expected_outcomes": {"type": "array", "items": {"type": "string"}},
-                "notes":             {"type": "array", "items": {"type": "string"}},
-            },
-            "required": ["program_title", "target_summary", "theory_sessions",
-                         "group_sessions", "expected_outcomes", "notes"],
-            "additionalProperties": False,
-        },
-    }
-
-    response = client.responses.create(
-        model="gpt-4.1-mini", text={"format": schema},
-        input=[{"role": "developer", "content": system_prompt},
-               {"role": "user", "content": user_prompt}],
+def build_chain(vectorstore: Chroma):
+    llm = ChatOpenAI(
+        model="gpt-4.1-mini",
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
     )
-    return json.loads(response.output_text.strip())
+    structured_llm = llm.with_structured_output(CurriculumPlan)
+
+    def retrieve_and_build_messages(input_dict: dict) -> list:
+        req    = input_dict["requirements"]
+        groups = input_dict["groups"]
+        ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
+
+        ctx_a = retrieve_group_context(vectorstore, ga["types"])
+        ctx_b = retrieve_group_context(vectorstore, gb["types"])
+        ctx_c = retrieve_group_context(vectorstore, gc["types"])
+
+        user_content = dedent(f"""
+            다음 기업 요구사항과 AX Compass 진단 결과를 바탕으로 맞춤형 교육 커리큘럼을 설계해줘.
+
+            [기업 요구사항]
+            회사/팀: {req['company_name']} | 목표: {req['goal']}
+            대상자: {req['audience']} | 수준: {req['level']}
+            기간: {req['duration']} | 주제: {req['topic']}
+            제한사항: {req['constraints']}
+
+            [그룹 구성]
+            - {ga['name']} ({' · '.join(ga['types'])}): {ga['count']}명
+            - {gb['name']} ({' · '.join(gb['types'])}): {gb['count']}명
+            - {gc['name']} ({' · '.join(gc['types'])}): {gc['count']}명
+
+            [AX Compass 유형별 특성 — 벡터 DB 시맨틱 검색 결과]
+            === 그룹 A ({' · '.join(ga['types'])}) ===
+            {ctx_a}
+
+            === 그룹 B ({' · '.join(gb['types'])}) ===
+            {ctx_b}
+
+            === 그룹 C ({' · '.join(gc['types'])}) ===
+            {ctx_c}
+        """).strip()
+
+        return [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=user_content),
+        ]
+
+    return RunnableLambda(retrieve_and_build_messages) | structured_llm
 
 
 # --- App 초기화 ---
-# Gunicorn --preload 옵션 사용 시 마스터 프로세스에서 한 번만 실행되어
-# 모든 워커가 초기화된 컬렉션을 공유한다.
+# Gunicorn --preload 옵션 사용 시 마스터 프로세스에서 한 번만 실행된다.
 
-_collection = init_collection()
+_vectorstore = init_vector_store()
+_chain = build_chain(_vectorstore)
 
 app = FastAPI(title="AI 커리큘럼 백엔드")
 
 
-class GenerateRequest(BaseModel):
-    requirements: dict
-    groups: dict
-
-
 @app.get("/health")
 def health(_: str = Security(verify_api_key)):
-    return {"status": "ok", "chunks": _collection.count()}
+    return {"status": "ok", "chunks": _vectorstore._collection.count()}
 
 
 @app.post("/generate")
 def generate(req: GenerateRequest, _: str = Security(verify_api_key)):
     try:
-        return run_rag(req.requirements, req.groups, _collection)
+        result: CurriculumPlan = _chain.invoke({
+            "requirements": req.requirements,
+            "groups": req.groups,
+        })
+        return result.model_dump()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
