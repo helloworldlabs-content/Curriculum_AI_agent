@@ -1,6 +1,5 @@
 import os
 
-import bcrypt
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -90,7 +89,8 @@ def apply_custom_css():
 # --- 백엔드 API ---
 
 def _headers() -> dict:
-    return {"X-API-Key": os.getenv("BACKEND_API_KEY", "")}
+    token = st.session_state.get("token", "")
+    return {"Authorization": f"Bearer {token}"}
 
 def _url(path: str) -> str:
     return os.getenv("BACKEND_URL", "").rstrip("/") + path
@@ -264,13 +264,20 @@ def render_login():
         submitted = st.form_submit_button("로그인", use_container_width=True)
 
     if submitted:
-        valid_username = os.getenv("AUTH_USERNAME", "admin")
-        valid_hash     = os.getenv("AUTH_PASSWORD_HASH", "")
-        if username == valid_username and bcrypt.checkpw(password.encode(), valid_hash.encode()):
-            st.session_state.logged_in = True
-            st.rerun()
-        else:
-            st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+        try:
+            resp = requests.post(
+                _url("/auth/login"),
+                json={"username": username, "password": password},
+                timeout=10,
+            )
+            if resp.ok:
+                st.session_state.token     = resp.json()["access_token"]
+                st.session_state.logged_in = True
+                st.rerun()
+            else:
+                st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+        except Exception as e:
+            st.error(f"백엔드 연결 실패: {e}")
 
 
 # --- 메인 ---

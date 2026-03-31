@@ -1,9 +1,12 @@
 import os
+from datetime import datetime, timedelta, timezone
 from textwrap import dedent
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException, Security
-from fastapi.security.api_key import APIKeyHeader
+import bcrypt
+import jwt
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.documents import Document
@@ -21,7 +24,11 @@ PDF_PATH        = os.path.join(DATA_DIR, "AXCompass.pdf")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
 COLLECTION_NAME = "ax_compass_v2"
 
-BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
+BACKEND_API_KEY  = os.getenv("BACKEND_API_KEY", "")
+JWT_SECRET       = os.getenv("JWT_SECRET", BACKEND_API_KEY)
+JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
+AUTH_USERNAME    = os.getenv("AUTH_USERNAME", "admin")
+AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH", "")
 
 TYPE_INFO = {
     "균형형": {"group": "A", "english": "BALANCED"},
@@ -139,14 +146,33 @@ class CollectedInfo(BaseModel):
 
 # --- Auth ---
 
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
-def verify_api_key(key: str = Security(api_key_header)) -> str:
-    if not BACKEND_API_KEY:
-        raise HTTPException(status_code=500, detail="서버에 BACKEND_API_KEY가 설정되지 않았습니다.")
-    if key != BACKEND_API_KEY:
-        raise HTTPException(status_code=403, detail="Invalid API Key")
-    return key
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+_bearer = HTTPBearer()
+
+def create_token(username: str) -> str:
+    payload = {
+        "sub": username,
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:
+    try:
+        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
+        return payload["sub"]
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
 
 
 # --- 메시지 변환 헬퍼 ---
@@ -337,13 +363,22 @@ _chain       = build_chain(_vectorstore)
 app = FastAPI(title="AI 커리큘럼 백엔드")
 
 
+@app.post("/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest):
+    if not AUTH_PASSWORD_HASH:
+        raise HTTPException(status_code=500, detail="서버에 AUTH_PASSWORD_HASH가 설정되지 않았습니다.")
+    if req.username != AUTH_USERNAME or not bcrypt.checkpw(req.password.encode(), AUTH_PASSWORD_HASH.encode()):
+        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
+    return TokenResponse(access_token=create_token(req.username))
+
+
 @app.get("/health")
-def health(_: str = Security(verify_api_key)):
+def health(_: str = Depends(verify_token)):
     return {"status": "ok", "chunks": _vectorstore._collection.count()}
 
 
 @app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, _: str = Security(verify_api_key)):
+def chat(req: ChatRequest, _: str = Depends(verify_token)):
     """정보 수집 대화. complete=True 시 collected_info도 함께 반환한다."""
     try:
         lc_messages = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
@@ -366,7 +401,7 @@ def chat(req: ChatRequest, _: str = Security(verify_api_key)):
 
 
 @app.post("/generate")
-def generate(req: GenerateRequest, _: str = Security(verify_api_key)):
+def generate(req: GenerateRequest, _: str = Depends(verify_token)):
     """collected_info를 받아 RAG 검색 + 커리큘럼 생성 (LLM 1회)."""
     try:
         info   = CollectedInfo(**req.collected_info)
