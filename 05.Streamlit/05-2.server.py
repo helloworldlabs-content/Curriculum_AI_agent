@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 BASE_DIR        = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
-COLLECTION_NAME = "ax_compass_types"
+COLLECTION_NAME = "ax_compass_contextual"
 
 BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
 
@@ -42,6 +42,39 @@ def detect_section_type(text: str) -> str:
         if any(kw in text for kw in keywords):
             return section
     return "일반"
+
+
+CONTEXTUALIZE_SYSTEM_PROMPT = "당신은 문서 청크에 맥락을 추가하는 전문가다. 간결하고 정확하게 답하라."
+
+CONTEXTUALIZE_HUMAN_PROMPT = dedent("""
+    다음은 AX Compass 기업 AI 교육 진단 문서의 일부 페이지다.
+
+    <document_page>
+    {page_content}
+    </document_page>
+
+    위 페이지에서 추출한 청크다.
+
+    <chunk>
+    {chunk_content}
+    </chunk>
+
+    이 청크가 문서에서 어떤 내용을 다루는지 1~2문장으로 한국어로 설명해라.
+    청크 내용을 그대로 반복하지 말고, 맥락만 간결하게 서술해라.
+""").strip()
+
+
+def contextualize_chunk(llm, page_content: str, chunk_content: str) -> str:
+    prompt = CONTEXTUALIZE_HUMAN_PROMPT.format(
+        page_content=page_content,
+        chunk_content=chunk_content,
+    )
+    response = llm.invoke([
+        SystemMessage(content=CONTEXTUALIZE_SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
+    ])
+    return response.content.strip()
+
 
 COLLECTION_SYSTEM_PROMPT = dedent("""
     당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 어시스턴트다.
@@ -176,6 +209,7 @@ def load_and_split_documents() -> list:
 
     print("[RAG] PDF 로드 중...")
     pages = PyPDFLoader(PDF_PATH).load()
+    page_texts = {p.metadata.get("page", i): p.page_content for i, p in enumerate(pages)}
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=300,
@@ -194,6 +228,17 @@ def load_and_split_documents() -> list:
                     "section_type": detect_section_type(chunk.page_content),
                 })
                 break
+
+    # Contextual Retrieval: 각 청크에 LLM 생성 맥락을 prepend
+    context_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+    print(f"[RAG] Contextual Retrieval: {len(chunks)}개 청크 컨텍스트 생성 중...")
+    for i, chunk in enumerate(chunks):
+        page_num  = chunk.metadata.get("page", 0)
+        page_text = page_texts.get(page_num, "")
+        context   = contextualize_chunk(context_llm, page_text, chunk.page_content)
+        chunk.page_content = f"{context}\n\n{chunk.page_content}"
+        if (i + 1) % 10 == 0:
+            print(f"[RAG]   {i + 1}/{len(chunks)} 완료")
 
     print(f"[RAG] {len(pages)}페이지 → {len(chunks)}개 청크 분할 완료")
     return chunks
