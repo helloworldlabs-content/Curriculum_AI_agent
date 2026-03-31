@@ -18,3 +18,5 @@ unstructured[xlsx]
 fastapi
 uvicorn
 gunicorn
+bcrypt
+PyJWT
