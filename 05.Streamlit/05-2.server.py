@@ -1,34 +1,24 @@
 import os
-import base64
 from textwrap import dedent
 
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
 # --- Config ---
 
 BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
-PDF_CACHE_PATH  = os.path.join(BASE_DIR, "Data", "ax_compass_full.txt")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
 COLLECTION_NAME = "ax_compass_types"
 
 BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
-
-TYPE_MARKERS = {
-    "균형형": "## 1) 균형형",
-    "실행형": "## 2) 실행형",
-    "판단형": "## 3) 판단형",
-    "이해형": "## 4) 이해형",
-    "과신형": "## 5) 과신형",
-    "조심형": "## 6) 조심형",
-}
 
 TYPE_INFO = {
     "균형형": {"group": "A", "english": "BALANCED"},
@@ -49,16 +39,21 @@ SYSTEM_PROMPT = dedent("""
 
     규칙:
     1. 그룹별 실습은 해당 유형의 강점을 활용하고 보완 방향을 실습 활동에 녹인다.
-    2. 각 회차는 title, goals, activities를 포함한다.
-    3. 기업 교육답게 실무 적용 중심으로 구성한다.
-    4. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
+    2. 각 회차는 title, duration_hours, goals, activities를 포함한다.
+    3. duration_hours는 시간 단위(소수점 가능)이며, 아래 시간 배분 규칙을 따른다:
+       - theory_sessions는 전체 참가자가 순차적으로 수강하므로 duration_hours 합산이 전체 시간에 포함된다.
+       - group_sessions는 3개 그룹이 동시에 진행되므로, 각 그룹의 duration_hours 합산은 모두 동일해야 한다.
+       - theory_sessions 합계 + 그룹 실습 합계(1개 그룹 기준) = 총 교육 시간
+    4. 기업 교육답게 실무 적용 중심으로 구성한다.
+    5. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
 """).strip()
 
 
-# --- Pydantic 스키마 (Structured Output + API 요청) ---
+# --- Pydantic 스키마 ---
 
 class Session(BaseModel):
     title: str
+    duration_hours: float
     goals: list[str]
     activities: list[str]
 
@@ -99,52 +94,31 @@ def verify_api_key(key: str = Security(api_key_header)) -> str:
 
 # --- RAG Pipeline ---
 
-def load_pdf_content() -> str:
-    if os.path.exists(PDF_CACHE_PATH):
-        with open(PDF_CACHE_PATH, "r", encoding="utf-8") as f:
-            return f.read()
+def load_and_split_documents() -> list:
     if not os.path.exists(PDF_PATH):
         raise FileNotFoundError(f"PDF 파일 없음: {PDF_PATH}")
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    with open(PDF_PATH, "rb") as f:
-        pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{"role": "user", "content": [
-            {"type": "input_file", "filename": "AXCompass.pdf",
-             "file_data": f"data:application/pdf;base64,{pdf_data}"},
-            {"type": "input_text", "text":
-             "이 PDF의 모든 내용을 한국어 마크다운으로 추출해줘. "
-             "각 유형의 강점, 보완 방향, 대표 태그를 포함하고 "
-             "각 유형 섹션은 '## 번호) 유형명' 형식으로 시작해줘."},
-        ]}],
+
+    print("[RAG] PDF 로드 중...")
+    pages = PyPDFLoader(PDF_PATH).load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+        separators=["\n\n", "\n", " "],
     )
-    content = response.output_text
-    os.makedirs(os.path.dirname(PDF_CACHE_PATH), exist_ok=True)
-    with open(PDF_CACHE_PATH, "w", encoding="utf-8") as f:
-        f.write(content)
-    return content
+    chunks = splitter.split_documents(pages)
 
+    for chunk in chunks:
+        for type_name, info in TYPE_INFO.items():
+            if type_name in chunk.page_content:
+                chunk.metadata.update({
+                    "type_name": type_name,
+                    "group": info["group"],
+                    "english": info["english"],
+                })
+                break
 
-def extract_type_chunks(pdf_content: str) -> list[dict]:
-    chunks = []
-    for type_name, marker in TYPE_MARKERS.items():
-        start = pdf_content.find(marker)
-        if start == -1:
-            continue
-        end = min(
-            (pdf_content.find(om, start + len(marker))
-             for om in TYPE_MARKERS.values() if om != marker
-             if pdf_content.find(om, start + len(marker)) != -1),
-            default=len(pdf_content),
-        )
-        info = TYPE_INFO[type_name]
-        chunks.append({
-            "id": type_name,
-            "text": pdf_content[start:end].strip(),
-            "metadata": {"type_name": type_name, "group": info["group"], "english": info["english"]},
-        })
+    print(f"[RAG] {len(pages)}페이지 → {len(chunks)}개 청크 분할 완료")
     return chunks
 
 
@@ -160,10 +134,9 @@ def init_vector_store() -> Chroma:
     )
     if vectorstore._collection.count() == 0:
         print("[VectorDB] 임베딩 생성 중...")
-        chunks = extract_type_chunks(load_pdf_content())
-        docs = [Document(page_content=c["text"], metadata=c["metadata"]) for c in chunks]
-        vectorstore.add_documents(docs, ids=[c["id"] for c in chunks])
-        print(f"[VectorDB] {len(docs)}개 청크 저장 완료")
+        chunks = load_and_split_documents()
+        vectorstore.add_documents(chunks)
+        print(f"[VectorDB] {len(chunks)}개 청크 저장 완료")
     else:
         print(f"[VectorDB] 기존 컬렉션 로드 완료 ({vectorstore._collection.count()}개 청크)")
     return vectorstore
@@ -191,6 +164,10 @@ def build_chain(vectorstore: Chroma):
         groups = input_dict["groups"]
         ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
 
+        total_hours  = int(req.get("total_hours", 0))
+        theory_hours = round(total_hours * 0.65)
+        group_hours  = total_hours - theory_hours
+
         ctx_a = retrieve_group_context(vectorstore, ga["types"])
         ctx_b = retrieve_group_context(vectorstore, gb["types"])
         ctx_c = retrieve_group_context(vectorstore, gc["types"])
@@ -201,8 +178,14 @@ def build_chain(vectorstore: Chroma):
             [기업 요구사항]
             회사/팀: {req['company_name']} | 목표: {req['goal']}
             대상자: {req['audience']} | 수준: {req['level']}
-            기간: {req['duration']} | 주제: {req['topic']}
+            총 교육 기간: {req['days']}일 (하루 {req['hours_per_day']}시간, 총 {total_hours}시간)
+            주제: {req['topic']}
             제한사항: {req['constraints']}
+
+            [시간 배분 기준]
+            - 이론 수업(theory_sessions) duration_hours 합계: 정확히 {theory_hours}시간
+            - 그룹 실습(group_sessions) duration_hours 합계 (1개 그룹 기준): 정확히 {group_hours}시간
+            - group_sessions는 3개 그룹이 동시에 진행되므로 각 그룹의 duration_hours 합산은 모두 동일해야 한다.
 
             [그룹 구성]
             - {ga['name']} ({' · '.join(ga['types'])}): {ga['count']}명
@@ -229,7 +212,6 @@ def build_chain(vectorstore: Chroma):
 
 
 # --- App 초기화 ---
-# Gunicorn --preload 옵션 사용 시 마스터 프로세스에서 한 번만 실행된다.
 
 _vectorstore = init_vector_store()
 _chain = build_chain(_vectorstore)
