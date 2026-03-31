@@ -4,8 +4,9 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
-from langchain.retrievers import EnsembleRetriever
+from langchain.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_chroma import Chroma
+from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
@@ -284,19 +285,25 @@ def retrieve_section(vectorstore: Chroma, type_names: list[str], section_type: s
     if not filtered_docs:
         return "(검색 결과 없음)"
 
-    k = min(k, len(filtered_docs))
+    k_final = min(k, len(filtered_docs))
+    k_fetch = min(k_final * 2, len(filtered_docs))  # rerank 전 더 많은 후보 수집
 
     vector_retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": k, "filter": where_filter},
+        search_kwargs={"k": k_fetch, "filter": where_filter},
     )
-    bm25_retriever = BM25Retriever.from_documents(filtered_docs, k=k)
+    bm25_retriever = BM25Retriever.from_documents(filtered_docs, k=k_fetch)
 
     ensemble = EnsembleRetriever(
         retrievers=[bm25_retriever, vector_retriever],
         weights=[0.5, 0.5],
     )
-    docs = ensemble.invoke(query)
+    reranker = FlashrankRerank(top_n=k_final)
+    reranking_retriever = ContextualCompressionRetriever(
+        base_compressor=reranker,
+        base_retriever=ensemble,
+    )
+    docs = reranking_retriever.invoke(query)
     return "\n\n".join(d.page_content for d in docs) if docs else "(검색 결과 없음)"
 
 
