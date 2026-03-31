@@ -10,6 +10,7 @@ langchain-chroma
 langchain-community
 langchain-text-splitters
 rank_bm25
+flashrank
 pypdf
 
 # 백엔드 (Docker)
