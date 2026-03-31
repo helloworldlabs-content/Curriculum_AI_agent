@@ -4,8 +4,11 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
+from langchain.retrievers import EnsembleRetriever
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.retrievers import BM25Retriever
+from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -265,14 +268,35 @@ def setup_vector_store() -> Chroma:
 
 
 def retrieve_section(vectorstore: Chroma, type_names: list[str], section_type: str, query: str) -> str:
-    docs = vectorstore.similarity_search(
-        query,
-        k=len(type_names) * 2,
-        filter={"$and": [
-            {"type_name":    {"$in": type_names}},
-            {"section_type": section_type},
-        ]},
+    where_filter = {"$and": [
+        {"type_name":    {"$in": type_names}},
+        {"section_type": section_type},
+    ]}
+    k = len(type_names) * 2
+
+    # BM25용 문서를 vectorstore에서 사전 필터링
+    result = vectorstore.get(where=where_filter, include=["documents", "metadatas"])
+    filtered_docs = [
+        Document(page_content=text, metadata=meta)
+        for text, meta in zip(result["documents"], result["metadatas"])
+    ]
+
+    if not filtered_docs:
+        return "(검색 결과 없음)"
+
+    k = min(k, len(filtered_docs))
+
+    vector_retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={"k": k, "filter": where_filter},
     )
+    bm25_retriever = BM25Retriever.from_documents(filtered_docs, k=k)
+
+    ensemble = EnsembleRetriever(
+        retrievers=[bm25_retriever, vector_retriever],
+        weights=[0.5, 0.5],
+    )
+    docs = ensemble.invoke(query)
     return "\n\n".join(d.page_content for d in docs) if docs else "(검색 결과 없음)"
 
 
