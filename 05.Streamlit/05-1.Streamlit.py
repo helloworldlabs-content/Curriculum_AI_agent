@@ -259,23 +259,20 @@ def render_sidebar():
 # --- 메인 ---
 
 def main():
-    if "authenticator" not in st.session_state:
-        credentials = {
-            "usernames": {
-                os.getenv("AUTH_USERNAME", "admin"): {
-                    "name":     os.getenv("AUTH_NAME", "관리자"),
-                    "password": os.getenv("AUTH_PASSWORD_HASH", ""),
-                }
+    credentials = {
+        "usernames": {
+            os.getenv("AUTH_USERNAME", "admin"): {
+                "name":     os.getenv("AUTH_NAME", "관리자"),
+                "password": os.getenv("AUTH_PASSWORD_HASH", ""),
             }
         }
-        st.session_state.authenticator = stauth.Authenticate(
-            credentials=credentials,
-            cookie_name="ax_curriculum_auth",
-            cookie_key=os.getenv("BACKEND_API_KEY", "fallback_secret"),
-            cookie_expiry_days=1,
-        )
-
-    authenticator = st.session_state.authenticator
+    }
+    authenticator = stauth.Authenticate(
+        credentials=credentials,
+        cookie_name="ax_curriculum_auth",
+        cookie_key=os.getenv("BACKEND_API_KEY", "fallback_secret"),
+        cookie_expiry_days=1,
+    )
     authenticator.login(location="main")
 
     if st.session_state.get("authentication_status") is False:
