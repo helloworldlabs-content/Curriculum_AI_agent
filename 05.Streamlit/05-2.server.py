@@ -1,34 +1,25 @@
 import os
-import base64
 from textwrap import dedent
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from pydantic import BaseModel
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pydantic import BaseModel, Field
 
 # --- Config ---
 
 BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
-PDF_CACHE_PATH  = os.path.join(BASE_DIR, "Data", "ax_compass_full.txt")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
 COLLECTION_NAME = "ax_compass_types"
 
 BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
-
-TYPE_MARKERS = {
-    "균형형": "## 1) 균형형",
-    "실행형": "## 2) 실행형",
-    "판단형": "## 3) 판단형",
-    "이해형": "## 4) 이해형",
-    "과신형": "## 5) 과신형",
-    "조심형": "## 6) 조심형",
-}
 
 TYPE_INFO = {
     "균형형": {"group": "A", "english": "BALANCED"},
@@ -39,9 +30,27 @@ TYPE_INFO = {
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
 
-SYSTEM_PROMPT = dedent("""
+COLLECTION_SYSTEM_PROMPT = dedent("""
+    당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 어시스턴트다.
+    아래 항목을 자연스러운 대화로 한 번에 1개씩 순서대로 수집해라.
+    사용자가 여러 정보를 한 번에 말하면 파악하고 빠진 항목만 추가 질문해라.
+    모든 항목이 수집되면 수집한 정보를 요약하고 마지막에 반드시 "[정보 수집 완료]"를 출력해라.
+
+    수집 항목:
+    - 회사명 또는 팀 이름
+    - 교육 목표
+    - 교육 대상자
+    - 현재 AI 활용 수준 (입문/초급/중급)
+    - 총 교육 기간 (일수, 숫자)
+    - 하루 교육 시간 (시간, 숫자)
+    - 원하는 핵심 주제
+    - 반영해야 할 조건 또는 제한사항
+    - AX Compass 진단 결과: 6개 유형별 인원수 (균형형, 이해형, 과신형, 실행형, 판단형, 조심형)
+""").strip()
+
+GENERATION_SYSTEM_PROMPT = dedent("""
     당신은 기업 교육용 AI 커리큘럼 설계 전문가다.
-    AX Compass 진단 결과와 유형별 특성을 바탕으로 맞춤형 교육 커리큘럼을 설계하라.
+    앞선 대화에서 수집한 기업 요구사항과 AX Compass 진단 결과를 바탕으로 맞춤형 교육 커리큘럼을 설계하라.
 
     커리큘럼 구조:
     - theory_sessions: 모든 참가자가 동일하게 수강하는 공통 이론 수업. 4개 이상 6개 이하.
@@ -49,16 +58,39 @@ SYSTEM_PROMPT = dedent("""
 
     규칙:
     1. 그룹별 실습은 해당 유형의 강점을 활용하고 보완 방향을 실습 활동에 녹인다.
-    2. 각 회차는 title, goals, activities를 포함한다.
-    3. 기업 교육답게 실무 적용 중심으로 구성한다.
-    4. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
+    2. 각 회차는 title, duration_hours, goals, activities를 포함한다.
+    3. duration_hours는 시간 단위(소수점 가능)이며, 아래 시간 배분 규칙을 따른다:
+       - theory_sessions는 전체 참가자가 순차적으로 수강하므로 duration_hours 합산이 전체 시간에 포함된다.
+       - group_sessions는 3개 그룹이 동시에 진행되므로, 각 그룹의 duration_hours 합산은 모두 동일해야 한다.
+       - theory_sessions 합계 + 그룹 실습 합계(1개 그룹 기준) = 총 교육 시간
+    4. 기업 교육답게 실무 적용 중심으로 구성한다.
+    5. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
 """).strip()
 
 
-# --- Pydantic 스키마 (Structured Output + API 요청) ---
+# --- Pydantic 스키마 ---
+
+class Message(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    messages: list[Message]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    complete: bool
+
+
+class GenerateRequest(BaseModel):
+    messages: list[Message]
+
 
 class Session(BaseModel):
     title: str
+    duration_hours: float
     goals: list[str]
     activities: list[str]
 
@@ -80,9 +112,21 @@ class CurriculumPlan(BaseModel):
     notes: list[str]
 
 
-class GenerateRequest(BaseModel):
-    requirements: dict
-    groups: dict
+class CollectedInfo(BaseModel):
+    company_name:        str = Field(description="회사명 또는 팀 이름")
+    goal:                str = Field(description="교육 목표")
+    audience:            str = Field(description="교육 대상자")
+    level:               str = Field(description="현재 AI 활용 수준")
+    days:                int = Field(description="총 교육 기간 (일수)")
+    hours_per_day:       int = Field(description="하루 교육 시간 (시간)")
+    topic:               str = Field(description="원하는 핵심 주제")
+    constraints:         str = Field(description="반영해야 할 조건 또는 제한사항")
+    count_balanced:      int = Field(description="균형형 인원수")
+    count_learner:       int = Field(description="이해형 인원수")
+    count_overconfident: int = Field(description="과신형 인원수")
+    count_doer:          int = Field(description="실행형 인원수")
+    count_analyst:       int = Field(description="판단형 인원수")
+    count_cautious:      int = Field(description="조심형 인원수")
 
 
 # --- Auth ---
@@ -97,54 +141,45 @@ def verify_api_key(key: str = Security(api_key_header)) -> str:
     return key
 
 
+# --- 메시지 변환 헬퍼 ---
+
+def to_lc_messages(messages: list[Message]) -> list:
+    result = []
+    for m in messages:
+        if m.role == "user":
+            result.append(HumanMessage(content=m.content))
+        else:
+            result.append(AIMessage(content=m.content))
+    return result
+
+
 # --- RAG Pipeline ---
 
-def load_pdf_content() -> str:
-    if os.path.exists(PDF_CACHE_PATH):
-        with open(PDF_CACHE_PATH, "r", encoding="utf-8") as f:
-            return f.read()
+def load_and_split_documents() -> list:
     if not os.path.exists(PDF_PATH):
         raise FileNotFoundError(f"PDF 파일 없음: {PDF_PATH}")
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    with open(PDF_PATH, "rb") as f:
-        pdf_data = base64.standard_b64encode(f.read()).decode("utf-8")
-    response = client.responses.create(
-        model="gpt-4.1-mini",
-        input=[{"role": "user", "content": [
-            {"type": "input_file", "filename": "AXCompass.pdf",
-             "file_data": f"data:application/pdf;base64,{pdf_data}"},
-            {"type": "input_text", "text":
-             "이 PDF의 모든 내용을 한국어 마크다운으로 추출해줘. "
-             "각 유형의 강점, 보완 방향, 대표 태그를 포함하고 "
-             "각 유형 섹션은 '## 번호) 유형명' 형식으로 시작해줘."},
-        ]}],
+
+    print("[RAG] PDF 로드 중...")
+    pages = PyPDFLoader(PDF_PATH).load()
+
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=500,
+        chunk_overlap=50,
+        separators=["\n\n", "\n", " "],
     )
-    content = response.output_text
-    os.makedirs(os.path.dirname(PDF_CACHE_PATH), exist_ok=True)
-    with open(PDF_CACHE_PATH, "w", encoding="utf-8") as f:
-        f.write(content)
-    return content
+    chunks = splitter.split_documents(pages)
 
+    for chunk in chunks:
+        for type_name, info in TYPE_INFO.items():
+            if type_name in chunk.page_content:
+                chunk.metadata.update({
+                    "type_name": type_name,
+                    "group": info["group"],
+                    "english": info["english"],
+                })
+                break
 
-def extract_type_chunks(pdf_content: str) -> list[dict]:
-    chunks = []
-    for type_name, marker in TYPE_MARKERS.items():
-        start = pdf_content.find(marker)
-        if start == -1:
-            continue
-        end = min(
-            (pdf_content.find(om, start + len(marker))
-             for om in TYPE_MARKERS.values() if om != marker
-             if pdf_content.find(om, start + len(marker)) != -1),
-            default=len(pdf_content),
-        )
-        info = TYPE_INFO[type_name]
-        chunks.append({
-            "id": type_name,
-            "text": pdf_content[start:end].strip(),
-            "metadata": {"type_name": type_name, "group": info["group"], "english": info["english"]},
-        })
+    print(f"[RAG] {len(pages)}페이지 → {len(chunks)}개 청크 분할 완료")
     return chunks
 
 
@@ -160,10 +195,9 @@ def init_vector_store() -> Chroma:
     )
     if vectorstore._collection.count() == 0:
         print("[VectorDB] 임베딩 생성 중...")
-        chunks = extract_type_chunks(load_pdf_content())
-        docs = [Document(page_content=c["text"], metadata=c["metadata"]) for c in chunks]
-        vectorstore.add_documents(docs, ids=[c["id"] for c in chunks])
-        print(f"[VectorDB] {len(docs)}개 청크 저장 완료")
+        chunks = load_and_split_documents()
+        vectorstore.add_documents(chunks)
+        print(f"[VectorDB] {len(chunks)}개 청크 저장 완료")
     else:
         print(f"[VectorDB] 기존 컬렉션 로드 완료 ({vectorstore._collection.count()}개 청크)")
     return vectorstore
@@ -178,38 +212,40 @@ def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
     return "\n\n".join(d.page_content for d in docs)
 
 
-def build_chain(vectorstore: Chroma):
-    llm = ChatOpenAI(
-        model="gpt-4.1-mini",
-        temperature=0,
-        api_key=os.getenv("OPENAI_API_KEY"),
-    )
+def build_generation_chain(vectorstore: Chroma):
+    llm = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)
 
     def retrieve_and_build_messages(input_dict: dict) -> list:
-        req    = input_dict["requirements"]
+        conversation = input_dict["conversation"]
+        info: CollectedInfo = input_dict["info"]
         groups = input_dict["groups"]
-        ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
+        total_hours  = info.days * info.hours_per_day
+        theory_hours = round(total_hours * 0.65)
+        group_hours  = total_hours - theory_hours
 
+        ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
         ctx_a = retrieve_group_context(vectorstore, ga["types"])
         ctx_b = retrieve_group_context(vectorstore, gb["types"])
         ctx_c = retrieve_group_context(vectorstore, gc["types"])
 
-        user_content = dedent(f"""
-            다음 기업 요구사항과 AX Compass 진단 결과를 바탕으로 맞춤형 교육 커리큘럼을 설계해줘.
+        chat_history = [m for m in conversation if not isinstance(m, SystemMessage)]
 
-            [기업 요구사항]
-            회사/팀: {req['company_name']} | 목표: {req['goal']}
-            대상자: {req['audience']} | 수준: {req['level']}
-            기간: {req['duration']} | 주제: {req['topic']}
-            제한사항: {req['constraints']}
+        rag_content = dedent(f"""
+            위 대화에서 수집한 요구사항을 바탕으로 맞춤형 교육 커리큘럼을 설계해줘.
+
+            [시간 배분 기준]
+            총 교육 시간: {total_hours}시간
+            - 이론 수업(theory_sessions) duration_hours 합계: 정확히 {theory_hours}시간
+            - 그룹 실습(group_sessions) duration_hours 합계 (1개 그룹 기준): 정확히 {group_hours}시간
+            - group_sessions는 3개 그룹이 동시에 진행되므로 각 그룹의 duration_hours 합산은 모두 동일해야 한다.
 
             [그룹 구성]
             - {ga['name']} ({' · '.join(ga['types'])}): {ga['count']}명
             - {gb['name']} ({' · '.join(gb['types'])}): {gb['count']}명
             - {gc['name']} ({' · '.join(gc['types'])}): {gc['count']}명
 
-            [AX Compass 유형별 특성 — 벡터 DB 시맨틱 검색 결과]
+            [AX Compass 유형별 특성 — 벡터 DB 검색 결과]
             === 그룹 A ({' · '.join(ga['types'])}) ===
             {ctx_a}
 
@@ -220,19 +256,20 @@ def build_chain(vectorstore: Chroma):
             {ctx_c}
         """).strip()
 
-        return [
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=user_content),
-        ]
+        return (
+            [SystemMessage(content=GENERATION_SYSTEM_PROMPT)]
+            + chat_history
+            + [HumanMessage(content=rag_content)]
+        )
 
     return RunnableLambda(retrieve_and_build_messages) | structured_llm
 
 
 # --- App 초기화 ---
-# Gunicorn --preload 옵션 사용 시 마스터 프로세스에서 한 번만 실행된다.
 
+_llm        = ChatOpenAI(model="gpt-4.1-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
 _vectorstore = init_vector_store()
-_chain = build_chain(_vectorstore)
+_gen_chain   = build_generation_chain(_vectorstore)
 
 app = FastAPI(title="AI 커리큘럼 백엔드")
 
@@ -242,12 +279,46 @@ def health(_: str = Security(verify_api_key)):
     return {"status": "ok", "chunks": _vectorstore._collection.count()}
 
 
+@app.post("/chat", response_model=ChatResponse)
+def chat(req: ChatRequest, _: str = Security(verify_api_key)):
+    """정보 수집 대화. complete=True가 되면 /generate를 호출해야 한다."""
+    try:
+        lc_messages = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
+        response = _llm.invoke(lc_messages)
+        reply    = response.content
+        complete = "[정보 수집 완료]" in reply
+        return ChatResponse(reply=reply, complete=complete)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/generate")
 def generate(req: GenerateRequest, _: str = Security(verify_api_key)):
+    """대화 히스토리를 받아 CollectedInfo 추출 후 커리큘럼 생성."""
     try:
-        result: CurriculumPlan = _chain.invoke({
-            "requirements": req.requirements,
-            "groups": req.groups,
+        # 수집된 정보 구조화 추출
+        extract_llm = _llm.with_structured_output(CollectedInfo)
+        lc_messages = to_lc_messages(req.messages)
+        info: CollectedInfo = extract_llm.invoke(
+            lc_messages + [HumanMessage(content="위 대화에서 수집한 모든 정보를 구조화해서 추출해줘.")]
+        )
+
+        # 그룹 구성
+        groups = {
+            "group_a": {"name": "그룹 A", "types": ["균형형", "이해형"],
+                        "count": info.count_balanced + info.count_learner},
+            "group_b": {"name": "그룹 B", "types": ["과신형", "실행형"],
+                        "count": info.count_overconfident + info.count_doer},
+            "group_c": {"name": "그룹 C", "types": ["판단형", "조심형"],
+                        "count": info.count_analyst + info.count_cautious},
+        }
+
+        # 커리큘럼 생성
+        conversation = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
+        result: CurriculumPlan = _gen_chain.invoke({
+            "conversation": conversation,
+            "info":         info,
+            "groups":       groups,
         })
         return result.model_dump()
     except Exception as e:
