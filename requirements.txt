@@ -10,6 +10,7 @@ langchain-chroma
 langchain-community
 langchain-text-splitters
 pypdf
+unstructured[pdf,xlsx]
 
 # 백엔드 (Docker)
 fastapi
