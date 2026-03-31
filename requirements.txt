@@ -1,6 +1,5 @@
 openai
 pygame
-chromadb
 streamlit
 requests
 
@@ -8,10 +7,11 @@ requests
 langchain
 langchain-openai
 langchain-chroma
-langchain-core
+langchain-community
+langchain-text-splitters
+pypdf
 
 # 백엔드 (Docker)
 fastapi
 uvicorn
 gunicorn
-pydantic
