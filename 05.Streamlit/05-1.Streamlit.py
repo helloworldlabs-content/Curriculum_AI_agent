@@ -1,8 +1,8 @@
 import os
 
+import bcrypt
 import requests
 import streamlit as st
-import streamlit_authenticator as stauth
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -256,33 +256,35 @@ def render_sidebar():
 
 # --- 인증 ---
 
+def render_login():
+    st.markdown("<h2 style='text-align:center;margin-top:80px;'>🔐 로그인</h2>", unsafe_allow_html=True)
+    with st.form("login_form"):
+        username = st.text_input("아이디")
+        password = st.text_input("비밀번호", type="password")
+        submitted = st.form_submit_button("로그인", use_container_width=True)
+
+    if submitted:
+        valid_username = os.getenv("AUTH_USERNAME", "admin")
+        valid_hash     = os.getenv("AUTH_PASSWORD_HASH", "")
+        if username == valid_username and bcrypt.checkpw(password.encode(), valid_hash.encode()):
+            st.session_state.logged_in = True
+            st.rerun()
+        else:
+            st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+
+
 # --- 메인 ---
 
 def main():
-    credentials = {
-        "usernames": {
-            os.getenv("AUTH_USERNAME", "admin"): {
-                "name":     os.getenv("AUTH_NAME", "관리자"),
-                "password": os.getenv("AUTH_PASSWORD_HASH", ""),
-            }
-        }
-    }
-    authenticator = stauth.Authenticate(
-        credentials=credentials,
-        cookie_name="ax_curriculum_auth",
-        cookie_key=os.getenv("BACKEND_API_KEY", "fallback_secret"),
-        cookie_expiry_days=1,
-    )
-    authenticator.login(location="main")
+    if not st.session_state.get("logged_in"):
+        render_login()
+        return
 
-    if st.session_state.get("authentication_status") is False:
-        st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
-        return
-    if st.session_state.get("authentication_status") is None:
-        return
-    # 인증 성공 시 사이드바에 로그아웃 버튼 표시
+    # 사이드바 로그아웃
     with st.sidebar:
-        authenticator.logout(button_name="로그아웃", location="unrendered")
+        if st.button("로그아웃", use_container_width=True):
+            st.session_state.logged_in = False
+            st.rerun()
 
 
     apply_custom_css()
