@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 st.set_page_config(page_title="AI 커리큘럼 설계", page_icon="◼", layout="wide")
 
 # --- CSS ---
@@ -93,6 +94,7 @@ def _headers() -> dict:
 
 def _url(path: str) -> str:
     return os.getenv("BACKEND_URL", "").rstrip("/") + path
+
 
 
 @st.cache_data(ttl=30)
@@ -285,6 +287,7 @@ def main():
     # 인증 성공 시 사이드바에 로그아웃 버튼 표시
     with st.sidebar:
         authenticator.logout(button_name="로그아웃", location="unrendered")
+
 
     apply_custom_css()
     init_session_state()
