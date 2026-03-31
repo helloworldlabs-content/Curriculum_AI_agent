@@ -14,14 +14,18 @@ STAGE_CONFIRM      = "confirm"
 STAGE_DONE         = "done"
 
 REQUIREMENT_FIELDS = [
-    ("company_name", "회사명 또는 팀 이름을 알려주세요."),
-    ("goal",         "교육 목표가 무엇인지 알려주세요."),
-    ("audience",     "교육 대상자는 누구인가요?"),
-    ("level",        "현재 AI 활용 수준을 알려주세요.\n> 예시: 입문 / 초급 / 중급 / 고급"),
-    ("duration",     "교육 기간 또는 총 시간은 얼마인가요?\n> 예시: 2일 / 16시간 / 4주"),
-    ("topic",        "원하는 핵심 주제는 무엇인가요?"),
-    ("constraints",  "꼭 반영해야 할 조건 또는 제한사항이 있나요?\n> 없으면 '없음'을 입력해주세요."),
+    ("company_name",   "회사명 또는 팀 이름을 알려주세요."),
+    ("goal",           "교육 목표가 무엇인지 알려주세요."),
+    ("audience",       "교육 대상자는 누구인가요?"),
+    ("level",          "현재 AI 활용 수준을 알려주세요.\n> 예시: 입문 / 초급 / 중급 / 고급"),
+    ("days",           "총 교육 기간은 며칠인가요?\n> 숫자만 입력해주세요. 예시: 3"),
+    ("hours_per_day",  "하루 교육 시간은 몇 시간인가요?\n> 숫자만 입력해주세요. 예시: 8"),
+    ("topic",          "원하는 핵심 주제는 무엇인가요?"),
+    ("constraints",    "꼭 반영해야 할 조건 또는 제한사항이 있나요?\n> 없으면 '없음'을 입력해주세요."),
 ]
+
+# days, hours_per_day 필드는 숫자 검증이 필요하다
+NUMERIC_FIELDS = {"days", "hours_per_day"}
 
 TYPE_FIELDS = ["균형형", "이해형", "과신형", "실행형", "판단형", "조심형"]
 
@@ -139,9 +143,11 @@ def check_backend_health() -> dict | None:
 
 
 def generate_curriculum(requirements: dict, groups: dict) -> dict:
+    req = dict(requirements)
+    req["total_hours"] = int(req["days"]) * int(req["hours_per_day"])
     resp = requests.post(
         _backend_url("/generate"),
-        json={"requirements": requirements, "groups": groups},
+        json={"requirements": req, "groups": groups},
         headers=_backend_headers(),
         timeout=180,
     )
@@ -187,17 +193,27 @@ def handle_user_input(user_input):
     elif stage == STAGE_REQUIREMENTS:
         idx = st.session_state.req_index
         field, _ = REQUIREMENT_FIELDS[idx]
-        st.session_state.requirements[field] = user_input
+        if field in NUMERIC_FIELDS:
+            digits = re.sub(r"[^0-9]", "", user_input)
+            if not digits:
+                add_msg("assistant", "숫자를 입력해주세요. 예: `3`")
+                return
+            st.session_state.requirements[field] = int(digits)
+        else:
+            st.session_state.requirements[field] = user_input
         st.session_state.req_index += 1
         nxt = st.session_state.req_index
-        if nxt < len(REQUIREMENT_FIELDS):
+        total = len(REQUIREMENT_FIELDS)
+        if nxt < total:
             _, nq = REQUIREMENT_FIELDS[nxt]
-            add_msg("assistant", f"**({nxt + 1}/7)** {nq}")
+            add_msg("assistant", f"**({nxt + 1}/{total})** {nq}")
         else:
             st.session_state.stage = STAGE_TYPE_COUNTS
             st.session_state.type_index = 0
+            req = st.session_state.requirements
             add_msg("assistant",
                 "요구사항 입력 완료! ✓\n\n"
+                f"총 교육 시간: **{req['days']}일 × {req['hours_per_day']}시간 = {int(req['days']) * int(req['hours_per_day'])}시간**\n\n"
                 "이제 **AX Compass 진단 결과**를 입력해주세요.\n"
                 f"**(1/6)** **{TYPE_FIELDS[0]}** 인원수를 입력해주세요.")
 
@@ -224,7 +240,7 @@ def handle_user_input(user_input):
             req = st.session_state.requirements
             add_msg("assistant",
                 "모든 정보 입력 완료! 아래 내용으로 커리큘럼을 생성할까요?\n\n"
-                f"**회사/팀** {req['company_name']}  |  **기간** {req['duration']}  |  **수준** {req['level']}\n\n"
+                f"**회사/팀** {req['company_name']}  |  **기간** {req['days']}일 × {req['hours_per_day']}시간  |  **수준** {req['level']}\n\n"
                 f"**그룹 A** (균형형·이해형) {groups['group_a']['count']}명  "
                 f"**그룹 B** (과신형·실행형) {groups['group_b']['count']}명  "
                 f"**그룹 C** (판단형·조심형) {groups['group_c']['count']}명  "
@@ -270,7 +286,8 @@ def render_chat_bubbles():
 
 
 def render_session_expander(session, index):
-    with st.expander(f"**{index}회차** — {session['title']}", expanded=(index == 1)):
+    label = f"**{index}회차** — {session['title']}  ·  {session['duration_hours']}시간"
+    with st.expander(label, expanded=(index == 1)):
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**학습 목표**")
