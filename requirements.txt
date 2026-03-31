@@ -12,6 +12,7 @@ langchain-text-splitters
 rank_bm25
 flashrank
 pypdf
+unstructured[xlsx]
 
 # 백엔드 (Docker)
 fastapi

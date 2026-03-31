@@ -2,7 +2,7 @@ import os
 from textwrap import dedent
 
 from langchain_chroma import Chroma
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
@@ -14,9 +14,10 @@ from pydantic import BaseModel, Field
 
 BASE_DIR        = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ENV_PATH        = os.path.join(BASE_DIR, ".env")
-PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
+DATA_DIR        = os.path.join(BASE_DIR, "Data")
+PDF_PATH        = os.path.join(DATA_DIR, "AXCompass.pdf")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
-COLLECTION_NAME = "ax_compass_types"
+COLLECTION_NAME = "ax_compass_v2"
 
 TYPE_MARKERS = {
     "균형형": "## 1) 균형형",
@@ -100,30 +101,60 @@ def load_env_file():
 # ─── RAG 1단계: PDF 로드 및 청크 분할 ───────────────────────────────────────
 
 def load_and_split_documents() -> list:
+    all_docs = []
+
+    # AX Compass PDF
     if not os.path.exists(PDF_PATH):
         raise FileNotFoundError(f"PDF 파일을 찾을 수 없습니다: {PDF_PATH}")
+    print("[RAG] AXCompass PDF 로드 중...")
+    ax_pages = PyPDFLoader(PDF_PATH).load()
+    for page in ax_pages:
+        page.metadata["doc_type"] = "ax_compass"
+    all_docs.extend(ax_pages)
 
-    print("[RAG] PDF 로드 중...")
-    pages = PyPDFLoader(PDF_PATH).load()
+    # 커리큘럼 예시 PDF (AXCompass.pdf 제외)
+    for fname in sorted(os.listdir(DATA_DIR)):
+        if fname.endswith(".pdf") and fname != "AXCompass.pdf":
+            fpath = os.path.join(DATA_DIR, fname)
+            print(f"[RAG] 커리큘럼 PDF 로드: {fname}")
+            course_name = os.path.splitext(fname)[0]
+            pages = PyPDFLoader(fpath).load()
+            for page in pages:
+                page.metadata.update({"doc_type": "curriculum_example", "course_name": course_name})
+            all_docs.extend(pages)
+
+    # 커리큘럼 예시 Excel
+    for fname in sorted(os.listdir(DATA_DIR)):
+        if fname.endswith(".xlsx"):
+            fpath = os.path.join(DATA_DIR, fname)
+            print(f"[RAG] 커리큘럼 Excel 로드: {fname}")
+            course_name = os.path.splitext(fname)[0]
+            docs = UnstructuredExcelLoader(fpath).load()
+            for doc in docs:
+                doc.metadata.update({"doc_type": "curriculum_example", "course_name": course_name})
+            all_docs.extend(docs)
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=50,
         separators=["\n\n", "\n", " "],
     )
-    chunks = splitter.split_documents(pages)
+    chunks = splitter.split_documents(all_docs)
 
     for chunk in chunks:
-        for type_name, info in TYPE_INFO.items():
-            if type_name in chunk.page_content:
-                chunk.metadata.update({
-                    "type_name": type_name,
-                    "group": info["group"],
-                    "english": info["english"],
-                })
-                break
+        if chunk.metadata.get("doc_type") == "ax_compass":
+            for type_name, info in TYPE_INFO.items():
+                if type_name in chunk.page_content:
+                    chunk.metadata.update({
+                        "type_name": type_name,
+                        "group":     info["group"],
+                        "english":   info["english"],
+                    })
+                    break
 
-    print(f"[RAG] {len(pages)}페이지 → {len(chunks)}개 청크 분할 완료")
+    ax_count = sum(1 for c in chunks if c.metadata.get("doc_type") == "ax_compass")
+    ex_count = len(chunks) - ax_count
+    print(f"[RAG] 총 {len(chunks)}개 청크 (AX Compass: {ax_count}, 커리큘럼 예시: {ex_count})")
     return chunks
 
 
@@ -155,11 +186,30 @@ def setup_vector_store() -> Chroma:
 
 def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
-    docs = vectorstore.similarity_search(
-        query, k=len(type_names),
-        filter={"type_name": {"$in": type_names}},
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": len(type_names),
+            "filter": {"$and": [
+                {"doc_type":  {"$eq": "ax_compass"}},
+                {"type_name": {"$in": type_names}},
+            ]},
+        },
     )
+    docs = retriever.invoke(query)
     return "\n\n".join(d.page_content for d in docs)
+
+
+def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": k,
+            "filter": {"doc_type": {"$eq": "curriculum_example"}},
+        },
+    )
+    docs = retriever.invoke(query)
+    return "\n\n---\n\n".join(d.page_content for d in docs)
 
 
 # ─── RAG 4단계: LCEL 체인 구성 ───────────────────────────────────────────────
@@ -181,6 +231,10 @@ GENERATION_SYSTEM_PROMPT = dedent("""
        - theory_sessions 합계 + 그룹 실습 합계(1개 그룹 기준) = 총 교육 시간
     4. 기업 교육답게 실무 적용 중심으로 구성한다.
     5. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
+    6. [커리큘럼 예시 참고 자료]가 제공되는 경우, 아래 기준으로 참고하되 내용을 그대로 복사하지 마라:
+       - 세션 제목과 구성 방식 (이론→실습 흐름, 주제 전개 순서 등)
+       - 활동 유형 (워크숍, 실습, 토론, 케이스 스터디 등)
+       - 강의 내용의 깊이와 수준 (용어, 난이도, 현업 적용 방식)
 """).strip()
 
 
@@ -196,6 +250,8 @@ def build_chain(vectorstore: Chroma):
         conversation  = input_dict["conversation"]
         groups        = input_dict["groups"]
         total_hours   = input_dict["total_hours"]
+        topic         = input_dict.get("topic", "")
+        level         = input_dict.get("level", "")
         ga, gb, gc    = groups["group_a"], groups["group_b"], groups["group_c"]
 
         # ① Retrieve
@@ -203,6 +259,10 @@ def build_chain(vectorstore: Chroma):
         ctx_a = retrieve_group_context(vectorstore, ga["types"])
         ctx_b = retrieve_group_context(vectorstore, gb["types"])
         ctx_c = retrieve_group_context(vectorstore, gc["types"])
+
+        print("[RAG] 커리큘럼 예시를 검색하는 중...")
+        curriculum_query = f"{topic} {level} 기업 AI 교육 커리큘럼"
+        curriculum_examples = retrieve_curriculum_examples(vectorstore, curriculum_query)
 
         # ② 대화 히스토리에서 SystemMessage 제외
         chat_history = [m for m in conversation if not isinstance(m, SystemMessage)]
@@ -234,6 +294,9 @@ def build_chain(vectorstore: Chroma):
 
             === 그룹 C ({' · '.join(gc['types'])}) ===
             {ctx_c}
+
+            [커리큘럼 예시 참고 자료 — 세션 구성 방식·활동 유형·강의 내용 수준을 참고할 것]
+            {curriculum_examples}
         """).strip()
 
         return (
@@ -366,6 +429,8 @@ def run_chatbot():
         "conversation": messages,
         "groups":       groups,
         "total_hours":  total_hours,
+        "topic":        info.topic,
+        "level":        info.level,
     })
 
     print_curriculum(result.model_dump())
