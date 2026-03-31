@@ -10,7 +10,7 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 앱 소스: 05-2.app.py → app.py 로 복사 (Gunicorn 모듈명 호환)
-COPY 05.Streamlit/05-2.app.py ./app.py
+COPY 05.Streamlit/05-2.server.py ./app.py
 
 # PDF 및 캐시 파일 복사
 COPY Data/ ./Data/
