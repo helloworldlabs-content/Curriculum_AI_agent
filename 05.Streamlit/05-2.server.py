@@ -185,7 +185,7 @@ def load_and_split_documents() -> list:
     return chunks
 
 
-def init_vector_store() -> Chroma:
+def setup_vector_store() -> Chroma:
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         api_key=os.getenv("OPENAI_API_KEY"),
@@ -214,7 +214,7 @@ def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
     return "\n\n".join(d.page_content for d in docs)
 
 
-def build_generation_chain(vectorstore: Chroma):
+def build_chain(vectorstore: Chroma):
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)
 
@@ -270,8 +270,8 @@ def build_generation_chain(vectorstore: Chroma):
 # --- App 초기화 ---
 
 _llm        = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-_vectorstore = init_vector_store()
-_gen_chain   = build_generation_chain(_vectorstore)
+_vectorstore = setup_vector_store()
+_chain       = build_chain(_vectorstore)
 
 app = FastAPI(title="AI 커리큘럼 백엔드")
 
@@ -318,7 +318,7 @@ def generate(req: GenerateRequest, _: str = Security(verify_api_key)):
                         "count": info.count_analyst + info.count_cautious},
         }
         conversation = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
-        result: CurriculumPlan = _gen_chain.invoke({
+        result: CurriculumPlan = _chain.invoke({
             "conversation": conversation,
             "info":         info,
             "groups":       groups,
