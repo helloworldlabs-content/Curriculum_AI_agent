@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 # --- Config ---
 
-BASE_DIR        = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BASE_DIR        = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
 COLLECTION_NAME = "ax_compass_types"
@@ -82,10 +82,12 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     complete: bool
+    collected_info: dict | None = None
 
 
 class GenerateRequest(BaseModel):
     messages: list[Message]
+    collected_info: dict
 
 
 class Session(BaseModel):
@@ -281,29 +283,32 @@ def health(_: str = Security(verify_api_key)):
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest, _: str = Security(verify_api_key)):
-    """정보 수집 대화. complete=True가 되면 /generate를 호출해야 한다."""
+    """정보 수집 대화. complete=True 시 collected_info도 함께 반환한다."""
     try:
         lc_messages = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
         response = _llm.invoke(lc_messages)
         reply    = response.content
         complete = "[정보 수집 완료]" in reply
-        return ChatResponse(reply=reply, complete=complete)
+
+        collected_info = None
+        if complete:
+            extract_llm = _llm.with_structured_output(CollectedInfo)
+            info: CollectedInfo = extract_llm.invoke(
+                lc_messages + [AIMessage(content=reply)]
+                + [HumanMessage(content="위 대화에서 수집한 모든 정보를 구조화해서 추출해줘.")]
+            )
+            collected_info = info.model_dump()
+
+        return ChatResponse(reply=reply, complete=complete, collected_info=collected_info)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/generate")
 def generate(req: GenerateRequest, _: str = Security(verify_api_key)):
-    """대화 히스토리를 받아 CollectedInfo 추출 후 커리큘럼 생성."""
+    """collected_info를 받아 RAG 검색 + 커리큘럼 생성 (LLM 1회)."""
     try:
-        # 수집된 정보 구조화 추출
-        extract_llm = _llm.with_structured_output(CollectedInfo)
-        lc_messages = to_lc_messages(req.messages)
-        info: CollectedInfo = extract_llm.invoke(
-            lc_messages + [HumanMessage(content="위 대화에서 수집한 모든 정보를 구조화해서 추출해줘.")]
-        )
-
-        # 그룹 구성
+        info   = CollectedInfo(**req.collected_info)
         groups = {
             "group_a": {"name": "그룹 A", "types": ["균형형", "이해형"],
                         "count": info.count_balanced + info.count_learner},
@@ -312,8 +317,6 @@ def generate(req: GenerateRequest, _: str = Security(verify_api_key)):
             "group_c": {"name": "그룹 C", "types": ["판단형", "조심형"],
                         "count": info.count_analyst + info.count_cautious},
         }
-
-        # 커리큘럼 생성
         conversation = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
         result: CurriculumPlan = _gen_chain.invoke({
             "conversation": conversation,

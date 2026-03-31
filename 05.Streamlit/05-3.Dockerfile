@@ -18,6 +18,8 @@ COPY Data/ ./Data/
 # vectorDB는 볼륨으로 마운트 (docker-compose.yml 참고)
 RUN mkdir -p ./vectorDB
 
+ENV APP_BASE_DIR=/app
+
 EXPOSE 8000
 
 # Gunicorn + uvicorn worker 설정
@@ -28,5 +30,5 @@ CMD ["gunicorn", "app:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "4", \
      "--bind", "0.0.0.0:8000", \
-     "--timeout", "180", \
+     "--timeout", "300", \
      "--preload"]
