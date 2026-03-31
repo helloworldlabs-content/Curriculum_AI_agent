@@ -1,6 +1,12 @@
-import requests
+import os
 
+import requests
 import streamlit as st
+import streamlit_authenticator as stauth
+from dotenv import load_dotenv
+
+load_dotenv()
+
 
 st.set_page_config(page_title="AI 커리큘럼 설계", page_icon="◼", layout="wide")
 
@@ -84,10 +90,11 @@ def apply_custom_css():
 # --- 백엔드 API ---
 
 def _headers() -> dict:
-    return {"X-API-Key": st.secrets["BACKEND_API_KEY"]}
+    return {"X-API-Key": os.getenv("BACKEND_API_KEY", "")}
 
 def _url(path: str) -> str:
-    return st.secrets["BACKEND_URL"].rstrip("/") + path
+    return os.getenv("BACKEND_URL", "").rstrip("/") + path
+
 
 
 @st.cache_data(ttl=30)
@@ -247,9 +254,41 @@ def render_sidebar():
             st.markdown('<div style="color:#ff6666;font-size:13px;">✗ 백엔드 연결 실패</div>', unsafe_allow_html=True)
 
 
+# --- 인증 ---
+
+def build_authenticator() -> stauth.Authenticate:
+    credentials = {
+        "usernames": {
+            os.getenv("AUTH_USERNAME", "admin"): {
+                "name":     os.getenv("AUTH_NAME", "관리자"),
+                "password": os.getenv("AUTH_PASSWORD_HASH", ""),
+            }
+        }
+    }
+    return stauth.Authenticate(
+        credentials=credentials,
+        cookie_name="ax_curriculum_auth",
+        cookie_key=os.getenv("BACKEND_API_KEY", "fallback_secret"),
+        cookie_expiry_days=1,
+    )
+
+
 # --- 메인 ---
 
 def main():
+    authenticator = build_authenticator()
+    authenticator.login(location="main")
+
+    if st.session_state.get("authentication_status") is False:
+        st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+        return
+    if st.session_state.get("authentication_status") is None:
+        return
+    # 인증 성공 시 사이드바에 로그아웃 버튼 표시
+    with st.sidebar:
+        authenticator.logout(button_name="로그아웃", location="unrendered")
+
+
     apply_custom_css()
     init_session_state()
     render_sidebar()

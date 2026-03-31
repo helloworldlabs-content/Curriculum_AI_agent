@@ -4,11 +4,8 @@ from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Security
 from fastapi.security.api_key import APIKeyHeader
-from langchain.retrievers import ContextualCompressionRetriever, EnsembleRetriever
 from langchain_chroma import Chroma
-from langchain_community.document_compressors.flashrank_rerank import FlashrankRerank
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_community.retrievers import BM25Retriever
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables import RunnableLambda
@@ -19,9 +16,10 @@ from pydantic import BaseModel, Field
 # --- Config ---
 
 BASE_DIR        = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-PDF_PATH        = os.path.join(BASE_DIR, "Data", "AXCompass.pdf")
+DATA_DIR        = os.path.join(BASE_DIR, "Data")
+PDF_PATH        = os.path.join(DATA_DIR, "AXCompass.pdf")
 VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
-COLLECTION_NAME = "ax_compass_contextual"
+COLLECTION_NAME = "ax_compass_v2"
 
 BACKEND_API_KEY = os.getenv("BACKEND_API_KEY", "")
 
@@ -33,52 +31,6 @@ TYPE_INFO = {
     "판단형": {"group": "C", "english": "ANALYST"},
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
-
-SECTION_MARKERS = {
-    "강점":   ["강점", "장점"],
-    "보완방향": ["보완 방향", "보완방향", "보완"],
-    "대표태그": ["대표 태그", "태그"],
-}
-
-
-def detect_section_type(text: str) -> str:
-    for section, keywords in SECTION_MARKERS.items():
-        if any(kw in text for kw in keywords):
-            return section
-    return "일반"
-
-
-CONTEXTUALIZE_SYSTEM_PROMPT = "당신은 문서 청크에 맥락을 추가하는 전문가다. 간결하고 정확하게 답하라."
-
-CONTEXTUALIZE_HUMAN_PROMPT = dedent("""
-    다음은 AX Compass 기업 AI 교육 진단 문서의 일부 페이지다.
-
-    <document_page>
-    {page_content}
-    </document_page>
-
-    위 페이지에서 추출한 청크다.
-
-    <chunk>
-    {chunk_content}
-    </chunk>
-
-    이 청크가 문서에서 어떤 내용을 다루는지 1~2문장으로 한국어로 설명해라.
-    청크 내용을 그대로 반복하지 말고, 맥락만 간결하게 서술해라.
-""").strip()
-
-
-def contextualize_chunk(llm, page_content: str, chunk_content: str) -> str:
-    prompt = CONTEXTUALIZE_HUMAN_PROMPT.format(
-        page_content=page_content,
-        chunk_content=chunk_content,
-    )
-    response = llm.invoke([
-        SystemMessage(content=CONTEXTUALIZE_SYSTEM_PROMPT),
-        HumanMessage(content=prompt),
-    ])
-    return response.content.strip()
-
 
 COLLECTION_SYSTEM_PROMPT = dedent("""
     당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 어시스턴트다.
@@ -115,6 +67,10 @@ GENERATION_SYSTEM_PROMPT = dedent("""
        - theory_sessions 합계 + 그룹 실습 합계(1개 그룹 기준) = 총 교육 시간
     4. 기업 교육답게 실무 적용 중심으로 구성한다.
     5. notes에는 유형별 특성과 기업 제한사항을 반영한 주의사항을 작성한다.
+    6. [커리큘럼 예시 참고 자료]가 제공되는 경우, 아래 기준으로 참고하되 내용을 그대로 복사하지 마라:
+       - 세션 제목과 구성 방식 (이론→실습 흐름, 주제 전개 순서 등)
+       - 활동 유형 (워크숍, 실습, 토론, 케이스 스터디 등)
+       - 강의 내용의 깊이와 수준 (용어, 난이도, 현업 적용 방식)
 """).strip()
 
 
@@ -208,43 +164,60 @@ def to_lc_messages(messages: list[Message]) -> list:
 # --- RAG Pipeline ---
 
 def load_and_split_documents() -> list:
+    all_docs = []
+
+    # AX Compass PDF
     if not os.path.exists(PDF_PATH):
         raise FileNotFoundError(f"PDF 파일 없음: {PDF_PATH}")
+    print("[RAG] AXCompass PDF 로드 중...")
+    ax_pages = PyPDFLoader(PDF_PATH).load()
+    for page in ax_pages:
+        page.metadata["doc_type"] = "ax_compass"
+    all_docs.extend(ax_pages)
 
-    print("[RAG] PDF 로드 중...")
-    pages = PyPDFLoader(PDF_PATH).load()
-    page_texts = {p.metadata.get("page", i): p.page_content for i, p in enumerate(pages)}
+    # 커리큘럼 예시 PDF (AXCompass.pdf 제외)
+    for fname in sorted(os.listdir(DATA_DIR)):
+        if fname.endswith(".pdf") and fname != "AXCompass.pdf":
+            fpath = os.path.join(DATA_DIR, fname)
+            print(f"[RAG] 커리큘럼 PDF 로드: {fname}")
+            course_name = os.path.splitext(fname)[0]
+            pages = PyPDFLoader(fpath).load()
+            for page in pages:
+                page.metadata.update({"doc_type": "curriculum_example", "course_name": course_name})
+            all_docs.extend(pages)
+
+    # 커리큘럼 예시 Excel
+    for fname in sorted(os.listdir(DATA_DIR)):
+        if fname.endswith(".xlsx"):
+            fpath = os.path.join(DATA_DIR, fname)
+            print(f"[RAG] 커리큘럼 Excel 로드: {fname}")
+            course_name = os.path.splitext(fname)[0]
+            docs = UnstructuredExcelLoader(fpath).load()
+            for doc in docs:
+                doc.metadata.update({"doc_type": "curriculum_example", "course_name": course_name})
+            all_docs.extend(docs)
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=300,
+        chunk_size=500,
         chunk_overlap=50,
-        separators=["\n\n", "\n", ". ", " "],
+        separators=["\n\n", "\n", " "],
     )
-    chunks = splitter.split_documents(pages)
+    chunks = splitter.split_documents(all_docs)
 
     for chunk in chunks:
-        for type_name, info in TYPE_INFO.items():
-            if type_name in chunk.page_content:
-                chunk.metadata.update({
-                    "type_name":    type_name,
-                    "group":        info["group"],
-                    "english":      info["english"],
-                    "section_type": detect_section_type(chunk.page_content),
-                })
-                break
+        if chunk.metadata.get("doc_type") == "ax_compass":
+            for type_name, info in TYPE_INFO.items():
+                if type_name in chunk.page_content:
+                    chunk.metadata.update({
+                        "type_name": type_name,
+                        "group":     info["group"],
+                        "english":   info["english"],
+                    })
+                    break
 
-    # Contextual Retrieval: 각 청크에 LLM 생성 맥락을 prepend
-    context_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-    print(f"[RAG] Contextual Retrieval: {len(chunks)}개 청크 컨텍스트 생성 중...")
-    for i, chunk in enumerate(chunks):
-        page_num  = chunk.metadata.get("page", 0)
-        page_text = page_texts.get(page_num, "")
-        context   = contextualize_chunk(context_llm, page_text, chunk.page_content)
-        chunk.page_content = f"{context}\n\n{chunk.page_content}"
-        if (i + 1) % 10 == 0:
-            print(f"[RAG]   {i + 1}/{len(chunks)} 완료")
-
-    print(f"[RAG] {len(pages)}페이지 → {len(chunks)}개 청크 분할 완료")
+    ax_count = sum(1 for c in chunks if c.metadata.get("doc_type") == "ax_compass")
+    ex_count = len(chunks) - ax_count
+    print(f"[RAG] 총 {len(chunks)}개 청크 (AX Compass: {ax_count}, 커리큘럼 예시: {ex_count})")
     return chunks
 
 
@@ -268,51 +241,32 @@ def setup_vector_store() -> Chroma:
     return vectorstore
 
 
-def retrieve_section(vectorstore: Chroma, type_names: list[str], section_type: str, query: str) -> str:
-    where_filter = {"$and": [
-        {"type_name":    {"$in": type_names}},
-        {"section_type": section_type},
-    ]}
-    k = len(type_names) * 2
-
-    # BM25용 문서를 vectorstore에서 사전 필터링
-    result = vectorstore.get(where=where_filter, include=["documents", "metadatas"])
-    filtered_docs = [
-        Document(page_content=text, metadata=meta)
-        for text, meta in zip(result["documents"], result["metadatas"])
-    ]
-
-    if not filtered_docs:
-        return "(검색 결과 없음)"
-
-    k_final = min(k, len(filtered_docs))
-    k_fetch = min(k_final * 2, len(filtered_docs))  # rerank 전 더 많은 후보 수집
-
-    vector_retriever = vectorstore.as_retriever(
+def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
+    query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
+    retriever = vectorstore.as_retriever(
         search_type="similarity",
-        search_kwargs={"k": k_fetch, "filter": where_filter},
+        search_kwargs={
+            "k": len(type_names),
+            "filter": {"$and": [
+                {"doc_type":  {"$eq": "ax_compass"}},
+                {"type_name": {"$in": type_names}},
+            ]},
+        },
     )
-    bm25_retriever = BM25Retriever.from_documents(filtered_docs, k=k_fetch)
-
-    ensemble = EnsembleRetriever(
-        retrievers=[bm25_retriever, vector_retriever],
-        weights=[0.5, 0.5],
-    )
-    reranker = FlashrankRerank(top_n=k_final)
-    reranking_retriever = ContextualCompressionRetriever(
-        base_compressor=reranker,
-        base_retriever=ensemble,
-    )
-    docs = reranking_retriever.invoke(query)
-    return "\n\n".join(d.page_content for d in docs) if docs else "(검색 결과 없음)"
+    docs = retriever.invoke(query)
+    return "\n\n".join(d.page_content for d in docs)
 
 
-def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> dict:
-    names = ', '.join(type_names)
-    return {
-        "strengths":    retrieve_section(vectorstore, type_names, "강점",   f"{names} 유형의 강점과 AI 활용 장점"),
-        "improvements": retrieve_section(vectorstore, type_names, "보완방향", f"{names} 유형의 보완 방향과 개선점"),
-    }
+def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": k,
+            "filter": {"doc_type": {"$eq": "curriculum_example"}},
+        },
+    )
+    docs = retriever.invoke(query)
+    return "\n\n---\n\n".join(d.page_content for d in docs)
 
 
 def build_chain(vectorstore: Chroma):
@@ -332,17 +286,10 @@ def build_chain(vectorstore: Chroma):
         ctx_b = retrieve_group_context(vectorstore, gb["types"])
         ctx_c = retrieve_group_context(vectorstore, gc["types"])
 
+        curriculum_query = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
+        curriculum_examples = retrieve_curriculum_examples(vectorstore, curriculum_query)
+
         chat_history = [m for m in conversation if not isinstance(m, SystemMessage)]
-
-        def group_ctx_block(name, types, ctx):
-            return dedent(f"""
-                === {name} ({' · '.join(types)}) ===
-                [강점]
-                {ctx['strengths']}
-
-                [보완방향]
-                {ctx['improvements']}
-            """).strip()
 
         rag_content = dedent(f"""
             위 대화에서 수집한 요구사항을 바탕으로 맞춤형 교육 커리큘럼을 설계해줘.
@@ -359,11 +306,17 @@ def build_chain(vectorstore: Chroma):
             - {gc['name']} ({' · '.join(gc['types'])}): {gc['count']}명
 
             [AX Compass 유형별 특성 — 벡터 DB 검색 결과]
-            {group_ctx_block(ga['name'], ga['types'], ctx_a)}
+            === 그룹 A ({' · '.join(ga['types'])}) ===
+            {ctx_a}
 
-            {group_ctx_block(gb['name'], gb['types'], ctx_b)}
+            === 그룹 B ({' · '.join(gb['types'])}) ===
+            {ctx_b}
 
-            {group_ctx_block(gc['name'], gc['types'], ctx_c)}
+            === 그룹 C ({' · '.join(gc['types'])}) ===
+            {ctx_c}
+
+            [커리큘럼 예시 참고 자료 — 세션 구성 방식·활동 유형·강의 내용 수준을 참고할 것]
+            {curriculum_examples}
         """).strip()
 
         return (
