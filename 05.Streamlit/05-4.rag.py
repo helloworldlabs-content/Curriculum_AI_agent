@@ -1,12 +1,6 @@
 import os
-from datetime import datetime, timedelta, timezone
 from textwrap import dedent
-from typing import Literal
 
-import bcrypt
-import jwt
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.documents import Document
@@ -14,22 +8,20 @@ from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pydantic import BaseModel, Field
 
-# --- Config ---
+from schemas import (
+    Message, CollectedInfo, CurriculumPlan,
+)
 
-BASE_DIR        = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DATA_DIR        = os.path.join(BASE_DIR, "Data")
-PDF_PATH        = os.path.join(DATA_DIR, "AXCompass.pdf")
-VECTOR_DB_PATH  = os.path.join(BASE_DIR, "vectorDB")
+# --- 경로 설정 ---
+
+BASE_DIR       = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DATA_DIR       = os.path.join(BASE_DIR, "Data")
+PDF_PATH       = os.path.join(DATA_DIR, "AXCompass.pdf")
+VECTOR_DB_PATH = os.path.join(BASE_DIR, "vectorDB")
 COLLECTION_NAME = "ax_compass_v2"
 
-BACKEND_API_KEY  = os.getenv("BACKEND_API_KEY", "")
-JWT_SECRET       = os.getenv("JWT_SECRET", BACKEND_API_KEY)
-JWT_EXPIRY_HOURS = int(os.getenv("JWT_EXPIRY_HOURS", "24"))
-AUTH_USERNAME    = os.getenv("AUTH_USERNAME", "admin")
-AUTH_PASSWORD_HASH = os.getenv("AUTH_PASSWORD_HASH", "")
-
+# AX Compass 6가지 유형 정보
 TYPE_INFO = {
     "균형형": {"group": "A", "english": "BALANCED"},
     "이해형": {"group": "A", "english": "LEARNER"},
@@ -38,6 +30,8 @@ TYPE_INFO = {
     "판단형": {"group": "C", "english": "ANALYST"},
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
+
+# --- 프롬프트 ---
 
 COLLECTION_SYSTEM_PROMPT = dedent("""
     당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 어시스턴트다.
@@ -81,115 +75,18 @@ GENERATION_SYSTEM_PROMPT = dedent("""
 """).strip()
 
 
-# --- Pydantic 스키마 ---
-
-class Message(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str
-
-
-class ChatRequest(BaseModel):
-    messages: list[Message]
-
-
-class ChatResponse(BaseModel):
-    reply: str
-    complete: bool
-    collected_info: dict | None = None
-
-
-class GenerateRequest(BaseModel):
-    messages: list[Message]
-    collected_info: dict
-
-
-class Session(BaseModel):
-    title: str
-    duration_hours: float
-    goals: list[str]
-    activities: list[str]
-
-
-class GroupSession(BaseModel):
-    group_name: str
-    target_types: str
-    participant_count: int
-    focus_description: str
-    sessions: list[Session]
-
-
-class CurriculumPlan(BaseModel):
-    program_title: str
-    target_summary: str
-    theory_sessions: list[Session]
-    group_sessions: list[GroupSession]
-    expected_outcomes: list[str]
-    notes: list[str]
-
-
-class CollectedInfo(BaseModel):
-    company_name:        str = Field(description="회사명 또는 팀 이름")
-    goal:                str = Field(description="교육 목표")
-    audience:            str = Field(description="교육 대상자")
-    level:               str = Field(description="현재 AI 활용 수준")
-    days:                int = Field(description="총 교육 기간 (일수)")
-    hours_per_day:       int = Field(description="하루 교육 시간 (시간)")
-    topic:               str = Field(description="원하는 핵심 주제")
-    constraints:         str = Field(description="반영해야 할 조건 또는 제한사항")
-    count_balanced:      int = Field(description="균형형 인원수")
-    count_learner:       int = Field(description="이해형 인원수")
-    count_overconfident: int = Field(description="과신형 인원수")
-    count_doer:          int = Field(description="실행형 인원수")
-    count_analyst:       int = Field(description="판단형 인원수")
-    count_cautious:      int = Field(description="조심형 인원수")
-
-
-# --- Auth ---
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    token_type: str = "bearer"
-
-
-_bearer = HTTPBearer()
-
-def create_token(username: str) -> str:
-    payload = {
-        "sub": username,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(_bearer)) -> str:
-    try:
-        payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=["HS256"])
-        return payload["sub"]
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="토큰이 만료되었습니다.")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="유효하지 않은 토큰입니다.")
-
-
 # --- 메시지 변환 헬퍼 ---
 
+_MSG_CLS = {"user": HumanMessage, "assistant": AIMessage}
+
 def to_lc_messages(messages: list[Message]) -> list:
-    result = []
-    for m in messages:
-        if m.role == "user":
-            result.append(HumanMessage(content=m.content))
-        else:
-            result.append(AIMessage(content=m.content))
-    return result
+    """Pydantic Message 리스트를 LangChain 메시지 객체 리스트로 변환한다."""
+    return [_MSG_CLS[m.role](content=m.content) for m in messages]
 
 
-# --- RAG Pipeline ---
+# --- 문서 로드 및 청킹 ---
 
-def load_and_split_documents() -> list:
+def load_and_split_documents() -> list[Document]:
     all_docs = []
 
     # AX Compass PDF
@@ -230,6 +127,7 @@ def load_and_split_documents() -> list:
     )
     chunks = splitter.split_documents(all_docs)
 
+    # AX Compass 청크에 유형 메타데이터 태깅
     for chunk in chunks:
         if chunk.metadata.get("doc_type") == "ax_compass":
             for type_name, info in TYPE_INFO.items():
@@ -246,6 +144,8 @@ def load_and_split_documents() -> list:
     print(f"[RAG] 총 {len(chunks)}개 청크 (AX Compass: {ax_count}, 커리큘럼 예시: {ex_count})")
     return chunks
 
+
+# --- 벡터 DB ---
 
 def setup_vector_store() -> Chroma:
     embeddings = OpenAIEmbeddings(
@@ -267,7 +167,10 @@ def setup_vector_store() -> Chroma:
     return vectorstore
 
 
+# --- 검색 함수 ---
+
 def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
+    """특정 AX Compass 유형들의 특성 정보를 벡터 DB에서 검색해 반환한다."""
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
     retriever = vectorstore.as_retriever(
         search_type="similarity",
@@ -284,6 +187,7 @@ def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
 
 
 def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
+    """주제와 수준에 맞는 커리큘럼 예시를 벡터 DB에서 검색해 반환한다."""
     retriever = vectorstore.as_retriever(
         search_type="similarity",
         search_kwargs={
@@ -295,14 +199,19 @@ def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) ->
     return "\n\n---\n\n".join(d.page_content for d in docs)
 
 
+# --- LCEL 체인 ---
+
 def build_chain(vectorstore: Chroma):
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+    """RAG 검색 + 커리큘럼 생성 LCEL 체인을 구성한다."""
+    llm            = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)
 
     def retrieve_and_build_messages(input_dict: dict) -> list:
         conversation = input_dict["conversation"]
         info: CollectedInfo = input_dict["info"]
         groups = input_dict["groups"]
+
+        # 총 시간을 이론 65% / 그룹 실습 35%로 미리 계산해서 LLM에 전달
         total_hours  = info.days * info.hours_per_day
         theory_hours = round(total_hours * 0.65)
         group_hours  = total_hours - theory_hours
@@ -312,9 +221,10 @@ def build_chain(vectorstore: Chroma):
         ctx_b = retrieve_group_context(vectorstore, gb["types"])
         ctx_c = retrieve_group_context(vectorstore, gc["types"])
 
-        curriculum_query = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
+        curriculum_query    = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
         curriculum_examples = retrieve_curriculum_examples(vectorstore, curriculum_query)
 
+        # SystemMessage는 이미 GENERATION_SYSTEM_PROMPT로 대체되므로 대화 기록에서 제외
         chat_history = [m for m in conversation if not isinstance(m, SystemMessage)]
 
         rag_content = dedent(f"""
@@ -352,73 +262,3 @@ def build_chain(vectorstore: Chroma):
         )
 
     return RunnableLambda(retrieve_and_build_messages) | structured_llm
-
-
-# --- App 초기화 ---
-
-_llm        = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-_vectorstore = setup_vector_store()
-_chain       = build_chain(_vectorstore)
-
-app = FastAPI(title="AI 커리큘럼 백엔드")
-
-
-@app.post("/auth/login", response_model=TokenResponse)
-def login(req: LoginRequest):
-    if not AUTH_PASSWORD_HASH:
-        raise HTTPException(status_code=500, detail="서버에 AUTH_PASSWORD_HASH가 설정되지 않았습니다.")
-    if req.username != AUTH_USERNAME or not bcrypt.checkpw(req.password.encode(), AUTH_PASSWORD_HASH.encode()):
-        raise HTTPException(status_code=401, detail="아이디 또는 비밀번호가 올바르지 않습니다.")
-    return TokenResponse(access_token=create_token(req.username))
-
-
-@app.get("/health")
-def health(_: str = Depends(verify_token)):
-    return {"status": "ok", "chunks": _vectorstore._collection.count()}
-
-
-@app.post("/chat", response_model=ChatResponse)
-def chat(req: ChatRequest, _: str = Depends(verify_token)):
-    """정보 수집 대화. complete=True 시 collected_info도 함께 반환한다."""
-    try:
-        lc_messages = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
-        response = _llm.invoke(lc_messages)
-        reply    = response.content
-        complete = "[정보 수집 완료]" in reply
-
-        collected_info = None
-        if complete:
-            extract_llm = _llm.with_structured_output(CollectedInfo)
-            info: CollectedInfo = extract_llm.invoke(
-                lc_messages + [AIMessage(content=reply)]
-                + [HumanMessage(content="위 대화에서 수집한 모든 정보를 구조화해서 추출해줘.")]
-            )
-            collected_info = info.model_dump()
-
-        return ChatResponse(reply=reply, complete=complete, collected_info=collected_info)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.post("/generate")
-def generate(req: GenerateRequest, _: str = Depends(verify_token)):
-    """collected_info를 받아 RAG 검색 + 커리큘럼 생성 (LLM 1회)."""
-    try:
-        info   = CollectedInfo(**req.collected_info)
-        groups = {
-            "group_a": {"name": "그룹 A", "types": ["균형형", "이해형"],
-                        "count": info.count_balanced + info.count_learner},
-            "group_b": {"name": "그룹 B", "types": ["과신형", "실행형"],
-                        "count": info.count_overconfident + info.count_doer},
-            "group_c": {"name": "그룹 C", "types": ["판단형", "조심형"],
-                        "count": info.count_analyst + info.count_cautious},
-        }
-        conversation = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
-        result: CurriculumPlan = _chain.invoke({
-            "conversation": conversation,
-            "info":         info,
-            "groups":       groups,
-        })
-        return result.model_dump()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
