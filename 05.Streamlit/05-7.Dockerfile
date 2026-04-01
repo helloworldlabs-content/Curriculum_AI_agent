@@ -1,5 +1,5 @@
 # 빌드 컨텍스트: 프로젝트 루트 (Curriculum_AI_agent/)
-# 실행: docker build -f 05.Streamlit/05-6.Dockerfile -t curriculum-backend .
+# 실행: docker build -f 05.Streamlit/05-7.Dockerfile -t curriculum-backend .
 
 FROM python:3.11-slim
 
@@ -10,16 +10,17 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 앱 소스 복사 (파일명 하이픈으로 인해 importlib 사용 — 원본 파일명 유지)
-# 05-5.main.py는 gunicorn 모듈명 호환을 위해 main.py로 복사
-COPY 05.Streamlit/05-2.schemas.py ./05-2.schemas.py
-COPY 05.Streamlit/05-3.auth.py    ./05-3.auth.py
-COPY 05.Streamlit/05-4.rag.py     ./05-4.rag.py
-COPY 05.Streamlit/05-5.main.py    ./main.py
+# 05-6.Main.py는 gunicorn 모듈명 호환을 위해 main.py로 복사
+COPY 05.Streamlit/05-2.Schemas.py      ./05-2.Schemas.py
+COPY 05.Streamlit/05-3.Auth.py         ./05-3.Auth.py
+COPY 05.Streamlit/05-4.Indexing.py     ./05-4.Indexing.py
+COPY 05.Streamlit/05-5.Retrieval.py    ./05-5.Retrieval.py
+COPY 05.Streamlit/05-6.Main.py         ./main.py
 
 # PDF 및 캐시 파일 복사
 COPY Data/ ./Data/
 
-# vectorDB는 볼륨으로 마운트 (05-7.docker-compose.yml 참고)
+# vectorDB는 볼륨으로 마운트 (05-8.docker-compose.yml 참고)
 RUN mkdir -p ./vectorDB
 
 ENV APP_BASE_DIR=/app
