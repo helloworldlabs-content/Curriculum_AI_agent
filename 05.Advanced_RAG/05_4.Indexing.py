@@ -10,15 +10,16 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
-# 이 파일은 "문서를 읽고 -> 정리하고 -> 잘게 나누고 -> 벡터 DB에 저장"하는 역할만 담당한다.
 BASE_DIR = os.environ.get("APP_BASE_DIR", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA_DIR = os.path.join(BASE_DIR, "Data")
 PDF_PATH = os.path.join(DATA_DIR, "AXCompass.pdf")
 VECTOR_DB_PATH = os.path.join(BASE_DIR, "vectorDB")
 
-AX_COLLECTION_NAME = "ax_compass_profiles_v3"
-CURRICULUM_COLLECTION_NAME = "curriculum_examples_v3"
+# 인덱싱 방식이 바뀌었으므로 컬렉션 이름도 새 버전으로 올린다.
+# 이렇게 하면 예전 포맷 청크와 새 포맷 청크가 뒤섞이지 않는다.
+COLLECTION_NAME = "advanced_rag_v3"
 
+# 문서 성격이 다르므로 청크 전략도 분리한다.
 AX_CHUNK_SIZE = 900
 AX_CHUNK_OVERLAP = 120
 CURRICULUM_CHUNK_SIZE = 700
@@ -29,14 +30,14 @@ TYPE_INFO = {
     "이해형": {"group": "A", "english": "LEARNER"},
     "과신형": {"group": "B", "english": "OVERCONFIDENT"},
     "실행형": {"group": "B", "english": "DOER"},
-    "판단형": {"group": "C", "english": "ANALYST"},
+    "진단형": {"group": "C", "english": "ANALYST"},
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
 
 
 def _clean_text(text: str) -> str:
-    # PDF/Excel에서 나온 들쭉날쭉한 공백을 정리해 검색 품질을 조금 더 안정적으로 만든다.
-    normalized_lines = []
+    # PDF/Excel에서 나온 들쭉날쭉한 공백을 정리해 검색 품질을 안정화한다.
+    normalized_lines: list[str] = []
     previous_blank = False
     for raw_line in text.splitlines():
         line = " ".join(raw_line.split())
@@ -70,22 +71,7 @@ def _extract_section_title(text: str, fallback: str) -> str:
     return fallback
 
 
-def _tag_ax_type(metadata: dict[str, Any], text: str) -> None:
-    # 본문에 유형명이 보이면 메타데이터에도 같이 넣어, 이후 필터 검색에 활용한다.
-    for type_name, info in TYPE_INFO.items():
-        if type_name in text:
-            metadata.update(
-                {
-                    "type_name": type_name,
-                    "group": info["group"],
-                    "english": info["english"],
-                }
-            )
-            return
-
-
 def _infer_curriculum_content_type(text: str) -> str:
-    # 커리큘럼 문서가 "목표 / 활동 / 세션 계획" 중 무엇에 가까운지 대략 분류한다.
     lowered = text.lower()
     if any(keyword in lowered for keyword in ("activity", "activities", "exercise", "workshop", "practice")):
         return "activity_plan"
@@ -97,8 +83,8 @@ def _infer_curriculum_content_type(text: str) -> str:
 
 
 def _format_excel_content(text: str) -> str:
-    # Excel은 셀 구조가 중요해서, 단순 문자열보다 태그가 붙은 형태로 바꿔 두는 편이 읽기 쉽다.
-    rows = []
+    # 엑셀은 행/열 구조가 중요하므로, 셀 경계를 최대한 읽기 쉽게 남긴다.
+    rows: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
@@ -117,9 +103,23 @@ def _format_excel_content(text: str) -> str:
     return "\n".join(rows).strip()
 
 
+def _tag_ax_type(metadata: dict[str, Any], text: str) -> None:
+    # 검색 시 바로 필터링할 수 있도록 유형 정보를 메타데이터에도 넣는다.
+    for type_name, info in TYPE_INFO.items():
+        if type_name in text:
+            metadata.update(
+                {
+                    "type_name": type_name,
+                    "group": info["group"],
+                    "english": info["english"],
+                }
+            )
+            return
+
+
 def _build_structured_document(content: str, metadata: dict[str, Any]) -> Document:
-    # 청킹 전에 핵심 메타데이터를 본문 앞에 붙여 둔다.
-    # 이렇게 하면 잘린 청크도 "어느 문서의 어떤 내용인지" 문맥을 더 잘 유지한다.
+    # 청킹 전에 핵심 메타데이터를 본문 앞에 붙여 두면,
+    # 잘린 청크도 "무슨 문서의 어떤 부분인지" 문맥을 더 잘 유지한다.
     header_fields = [
         "doc_type",
         "source_name",
@@ -133,7 +133,7 @@ def _build_structured_document(content: str, metadata: dict[str, Any]) -> Docume
         "group",
         "english",
     ]
-    header_lines = []
+    header_lines: list[str] = []
     for field_name in header_fields:
         value = metadata.get(field_name)
         if value not in (None, ""):
@@ -144,8 +144,7 @@ def _build_structured_document(content: str, metadata: dict[str, Any]) -> Docume
 
 
 def _annotate_chunks(chunks: list[Document]) -> list[Document]:
-    # 각 청크에 추적용 메타데이터를 붙여 둔다.
-    # chunk_id / content_hash는 중복 방지나 이후 증분 인덱싱의 기반이 된다.
+    # chunk_id / content_hash를 넣어 두면 나중에 증분 인덱싱을 붙이기 쉽다.
     source_counters: dict[tuple[str, str, str], int] = {}
     for chunk in chunks:
         source_key = (
@@ -166,8 +165,6 @@ def _annotate_chunks(chunks: list[Document]) -> list[Document]:
                 "indexed_at": datetime.now(timezone.utc).isoformat(),
             }
         )
-        if chunk.metadata.get("doc_type") == "ax_compass":
-            _tag_ax_type(chunk.metadata, chunk.page_content)
     return chunks
 
 
@@ -177,7 +174,6 @@ def _split_documents_with_strategy(
     chunk_size: int,
     chunk_overlap: int,
 ) -> list[Document]:
-    # 문서 종류마다 다른 크기로 자르되, [content] 경계를 먼저 보도록 분리 기준을 준다.
     if not docs:
         return []
 
@@ -189,30 +185,28 @@ def _split_documents_with_strategy(
     return _annotate_chunks(splitter.split_documents(docs))
 
 
-def _load_pdf_pages(fpath: str, metadata_builder) -> list[Document]:
-    # PDF 공통 로더. "페이지 읽기 + 텍스트 정리 + 메타데이터 생성"을 한 번에 처리한다.
-    documents = []
-    for page in PyPDFLoader(fpath).load():
+def _load_pdf_pages(file_path: str, metadata_builder) -> list[Document]:
+    documents: list[Document] = []
+    for page in PyPDFLoader(file_path).load():
         body = _clean_text(page.page_content)
         if not body:
             continue
-        metadata = metadata_builder(page, body, fpath)
+        metadata = metadata_builder(page, body, file_path)
         documents.append(_build_structured_document(body, metadata))
     return documents
 
 
 def load_ax_compass_documents() -> list[Document]:
-    # AX Compass는 유형 설명 문서라서, page_number / section_title / type_name 정보가 특히 중요하다.
     if not os.path.exists(PDF_PATH):
-        raise FileNotFoundError(f"PDF 파일 없음: {PDF_PATH}")
+        raise FileNotFoundError(f"PDF file not found: {PDF_PATH}")
 
-    print("[RAG] AXCompass PDF 로드 중...")
+    print("[RAG] Loading AXCompass PDF...")
 
-    def _build_meta(page, body, fpath):
-        source_file = page.metadata.get("source", fpath)
+    def _build_meta(page: Document, body: str, file_path: str) -> dict[str, Any]:
+        source_file = page.metadata.get("source", file_path)
         page_number = _page_number_from_metadata(page.metadata.get("page"))
         section_title = _extract_section_title(body, f"ax_page_{page_number or 'unknown'}")
-        metadata = {
+        metadata: dict[str, Any] = {
             "doc_type": "ax_compass",
             "source_file": source_file,
             "source_name": os.path.basename(source_file),
@@ -227,53 +221,51 @@ def load_ax_compass_documents() -> list[Document]:
 
 
 def load_curriculum_pdf_documents() -> list[Document]:
-    # 커리큘럼 PDF 예시는 과정명과 섹션명을 같이 남겨 두면 나중에 참고 사례 검색에 유리하다.
-    documents = []
-    for fname in sorted(os.listdir(DATA_DIR)):
-        if not fname.endswith(".pdf") or fname == "AXCompass.pdf":
+    documents: list[Document] = []
+    for filename in sorted(os.listdir(DATA_DIR)):
+        if not filename.endswith(".pdf") or filename == "AXCompass.pdf":
             continue
 
-        fpath = os.path.join(DATA_DIR, fname)
-        course_name = os.path.splitext(fname)[0]
-        print(f"[RAG] 커리큘럼 PDF 로드: {fname}")
+        file_path = os.path.join(DATA_DIR, filename)
+        course_name = os.path.splitext(filename)[0]
+        print(f"[RAG] Loading curriculum PDF: {filename}")
 
-        def _build_meta(page, body, pdf_path, _course=course_name):
+        def _build_meta(page: Document, body: str, pdf_path: str, course: str = course_name) -> dict[str, Any]:
             source_file = page.metadata.get("source", pdf_path)
             page_number = _page_number_from_metadata(page.metadata.get("page"))
-            section_title = _extract_section_title(body, _course)
+            section_title = _extract_section_title(body, course)
             return {
                 "doc_type": "curriculum_example",
                 "source_file": source_file,
                 "source_name": os.path.basename(source_file),
-                "course_name": _course,
+                "course_name": course,
                 "page_number": page_number,
                 "section_title": section_title,
                 "module_name": section_title,
                 "content_type": _infer_curriculum_content_type(body),
             }
 
-        documents.extend(_load_pdf_pages(fpath, _build_meta))
+        documents.extend(_load_pdf_pages(file_path, _build_meta))
 
     return documents
 
 
 def load_curriculum_excel_documents() -> list[Document]:
-    # Excel 예시는 시트 구조를 최대한 살려야 검색 시 의미가 덜 깨진다.
-    documents = []
-    for fname in sorted(os.listdir(DATA_DIR)):
-        if not fname.endswith(".xlsx"):
+    documents: list[Document] = []
+    for filename in sorted(os.listdir(DATA_DIR)):
+        if not filename.endswith(".xlsx"):
             continue
 
-        fpath = os.path.join(DATA_DIR, fname)
-        course_name = os.path.splitext(fname)[0]
-        print(f"[RAG] 커리큘럼 Excel 로드: {fname}")
+        file_path = os.path.join(DATA_DIR, filename)
+        course_name = os.path.splitext(filename)[0]
+        print(f"[RAG] Loading curriculum Excel: {filename}")
 
-        for sheet_index, doc in enumerate(UnstructuredExcelLoader(fpath).load(), start=1):
+        for sheet_index, doc in enumerate(UnstructuredExcelLoader(file_path).load(), start=1):
             body = _format_excel_content(doc.page_content)
             if not body:
                 continue
 
-            source_file = doc.metadata.get("source", fpath)
+            source_file = doc.metadata.get("source", file_path)
             sheet_name = (
                 doc.metadata.get("page_name")
                 or doc.metadata.get("sheet_name")
@@ -296,26 +288,24 @@ def load_curriculum_excel_documents() -> list[Document]:
 
 
 def load_ax_compass_chunks() -> list[Document]:
-    # AX Compass는 설명형 문서라 청크를 조금 더 크게 잡는다.
     docs = load_ax_compass_documents()
     chunks = _split_documents_with_strategy(
         docs,
         chunk_size=AX_CHUNK_SIZE,
         chunk_overlap=AX_CHUNK_OVERLAP,
     )
-    print(f"[RAG] AX Compass 청크 수: {len(chunks)}")
+    print(f"[RAG] AX Compass chunk count: {len(chunks)}")
     return chunks
 
 
 def load_curriculum_chunks() -> list[Document]:
-    # 커리큘럼 예시는 세션 단위 정보가 많아서 AX Compass보다 약간 더 촘촘하게 자른다.
     docs = load_curriculum_pdf_documents() + load_curriculum_excel_documents()
     chunks = _split_documents_with_strategy(
         docs,
         chunk_size=CURRICULUM_CHUNK_SIZE,
         chunk_overlap=CURRICULUM_CHUNK_OVERLAP,
     )
-    print(f"[RAG] 커리큘럼 예시 청크 수: {len(chunks)}")
+    print(f"[RAG] Curriculum example chunk count: {len(chunks)}")
     return chunks
 
 
@@ -323,17 +313,8 @@ def _collection_count(vectorstore: Chroma) -> int:
     return vectorstore._collection.count()
 
 
-def _create_vector_store(embeddings: OpenAIEmbeddings, collection_name: str) -> Chroma:
-    # 컬렉션 이름을 분리해 두면 AX Compass와 커리큘럼 예시를 독립적으로 다룰 수 있다.
-    return Chroma(
-        collection_name=collection_name,
-        embedding_function=embeddings,
-        persist_directory=VECTOR_DB_PATH,
-    )
-
-
 def _get_indexed_hashes(vectorstore: Chroma) -> set[str]:
-    # 이미 들어간 청크의 해시를 읽어 와서, 같은 내용이 다시 들어가지 않도록 한다.
+    # 이미 저장된 content_hash를 읽어 와서 같은 청크를 다시 넣지 않는다.
     try:
         result = vectorstore._collection.get(include=["metadatas"])
     except Exception:
@@ -351,45 +332,39 @@ def _filter_new_documents(docs: list[Document], indexed_hashes: set[str]) -> lis
 
 
 def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
-    # 첫 실행이면 전체 인덱싱, 이후에는 새 해시만 추가한다.
-    # 아직 "수정/삭제 동기화"까지는 아니지만, 완전 재색인보다 훨씬 가볍게 시작할 수 있다.
+    # 첫 실행은 전체 인덱싱, 이후에는 새 청크만 추가하는 구조다.
+    # 삭제/수정 동기화는 아직 아니지만, 증분 인덱싱으로 확장하기 쉬운 형태다.
     existing_count = _collection_count(vectorstore)
     chunks = loader()
 
     if existing_count == 0:
-        print(f"[VectorDB] {label} 컬렉션 인덱싱 중...")
+        print(f"[VectorDB] Indexing {label} collection...")
         if chunks:
             vectorstore.add_documents(chunks)
-        print(f"[VectorDB] {label} 컬렉션 완료 ({len(chunks)}개 청크)")
+        print(f"[VectorDB] {label} indexed ({len(chunks)} chunks)")
         return
 
     indexed_hashes = _get_indexed_hashes(vectorstore)
     new_chunks = _filter_new_documents(chunks, indexed_hashes)
     if new_chunks:
-        print(f"[VectorDB] {label} 신규 청크 {len(new_chunks)}개 추가 중...")
+        print(f"[VectorDB] Adding {len(new_chunks)} new {label} chunks...")
         vectorstore.add_documents(new_chunks)
-        print(f"[VectorDB] {label} 추가 완료 ({_collection_count(vectorstore)}개 청크)")
+        print(f"[VectorDB] {label} updated ({_collection_count(vectorstore)} chunks)")
     else:
-        print(f"[VectorDB] {label} 변경 없음. 기존 컬렉션 유지 ({existing_count}개 청크)")
+        print(f"[VectorDB] No new {label} chunks. Keeping existing index ({existing_count} chunks)")
 
 
-def setup_vector_stores() -> dict[str, Chroma]:
-    # 문서 성격이 다른 두 컬렉션을 분리해 두면 검색 의도를 더 명확하게 나눌 수 있다.
+def setup_vector_store() -> Chroma:
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         api_key=os.getenv("OPENAI_API_KEY"),
     )
-    ax_store = _create_vector_store(embeddings, AX_COLLECTION_NAME)
-    curriculum_store = _create_vector_store(embeddings, CURRICULUM_COLLECTION_NAME)
+    vectorstore = Chroma(
+        collection_name=COLLECTION_NAME,
+        embedding_function=embeddings,
+        persist_directory=VECTOR_DB_PATH,
+    )
 
-    _ensure_index(ax_store, load_ax_compass_chunks, "AX Compass")
-    _ensure_index(curriculum_store, load_curriculum_chunks, "커리큘럼 예시")
-
-    return {
-        "ax_compass": ax_store,
-        "curriculum_examples": curriculum_store,
-    }
-
-
-def setup_vector_store():
-    return setup_vector_stores()
+    _ensure_index(vectorstore, load_ax_compass_chunks, "AX Compass")
+    _ensure_index(vectorstore, load_curriculum_chunks, "Curriculum examples")
+    return vectorstore

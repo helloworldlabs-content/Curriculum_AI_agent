@@ -1,0 +1,16 @@
+# 실행: docker-compose -f 05.Advanced_RAG/05_8.docker-compose.yml up --build
+# 중지: docker-compose -f 05.Advanced_RAG/05_8.docker-compose.yml down
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: 05.Advanced_RAG/05_7.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../Data:/app/Data
+      - ../vectorDB:/app/vectorDB
+    env_file:
+      - ../.env
+    restart: unless-stopped

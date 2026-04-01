@@ -1,9 +1,10 @@
+import logging
 import os
+import re
+from time import perf_counter
 from textwrap import dedent
-from typing import Any
 
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
@@ -11,7 +12,12 @@ from langchain_openai import ChatOpenAI
 from schemas import CollectedInfo, CurriculumPlan, Message
 
 
-# 이 파일은 "무엇을 찾을지"와 "찾은 내용을 어떻게 LLM에 넘길지"를 담당한다.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+logger = logging.getLogger("curriculum_backend.retrieval")
+
+
 COLLECTION_SYSTEM_PROMPT = dedent(
     """
     당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 어시스턴트다.
@@ -61,70 +67,156 @@ _MSG_CLS = {"user": HumanMessage, "assistant": AIMessage}
 
 
 def to_lc_messages(messages: list[Message]) -> list:
-    # FastAPI 요청 형식을 LangChain 메시지 형식으로 바꿔, LLM에 바로 전달할 수 있게 한다.
-    return [_MSG_CLS[m.role](content=m.content) for m in messages]
+    return [_MSG_CLS[message.role](content=message.content) for message in messages]
 
 
-def _retrieve(vectorstore: Chroma, query: str, k: int, filter: dict[str, Any] | None = None) -> list[Document]:
-    # 검색 공통 함수. 필요하면 메타데이터 필터까지 함께 건다.
-    search_kwargs: dict[str, Any] = {"k": k}
-    if filter:
-        search_kwargs["filter"] = filter
-    return vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs).invoke(query)
+def _retrieve(
+    vectorstore: Chroma,
+    query: str,
+    *,
+    k: int,
+    search_filter: dict,
+    label: str,
+):
+    logger.info("[GENERATE][%s] retrieval start k=%s query=%s", label, k, query[:160])
+    started_at = perf_counter()
+    retriever = vectorstore.as_retriever(
+        search_type="similarity",
+        search_kwargs={
+            "k": k,
+            "filter": search_filter,
+        },
+    )
+    docs = retriever.invoke(query)
+    logger.info(
+        "[GENERATE][%s] retrieval done docs=%s chars=%s elapsed=%.2fs",
+        label,
+        len(docs),
+        sum(len(doc.page_content) for doc in docs),
+        perf_counter() - started_at,
+    )
+    return docs
 
 
-def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
-    # AX Compass 쪽은 "특정 유형"만 보고 싶으므로 type_name 필터를 함께 사용한다.
+def retrieve_group_context(vectorstore: Chroma, type_names: list[str], *, group_label: str) -> str:
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
     docs = _retrieve(
         vectorstore,
         query,
-        max(4, len(type_names) * 3),
-        {"type_name": {"$in": type_names}},
+        k=max(4, len(type_names) * 2),
+        search_filter={
+            "$and": [
+                {"doc_type": {"$eq": "ax_compass"}},
+                {"type_name": {"$in": type_names}},
+            ]
+        },
+        label=f"{group_label}_ax",
     )
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
-    # 커리큘럼 예시는 유사한 사례를 몇 개 가져와 생성 단계의 참고 자료로 쓴다.
-    docs = _retrieve(vectorstore, query, k)
-    return "\n\n---\n\n".join(doc.page_content for doc in docs)
+def _keyword_tokens(*texts: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        for token in re.findall(r"[0-9A-Za-z가-힣+#/.]{2,}", text or ""):
+            lowered = token.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            tokens.append(token)
+    return tokens
 
 
-def build_chain(vectorstores: dict[str, Chroma]):
-    # 최종 체인은 "검색 -> 프롬프트 조립 -> 구조화 출력" 순서로 동작한다.
+def _build_curriculum_query(info: CollectedInfo) -> str:
+    return dedent(
+        f"""
+        기업 맞춤형 AI 교육 커리큘럼 예시를 찾는다.
+        강의 주제: {info.topic}
+        교육 목표: {info.goal}
+        교육 대상자: {info.audience}
+        현재 수준: {info.level}
+        반영 조건 및 제한사항: {info.constraints}
+        총 교육 시간: {info.days * info.hours_per_day}시간
+        실무 적용 중심의 기업 교육 사례
+        """
+    ).strip()
+
+
+def _score_curriculum_doc(doc, info: CollectedInfo) -> int:
+    haystack = " ".join(
+        [
+            doc.page_content,
+            str(doc.metadata.get("course_name", "")),
+        ]
+    ).lower()
+    primary_tokens = _keyword_tokens(info.topic, info.goal)
+    secondary_tokens = _keyword_tokens(info.audience, info.level, info.constraints)
+
+    score = 0
+    for token in primary_tokens:
+        if token.lower() in haystack:
+            score += 3
+    for token in secondary_tokens:
+        if token.lower() in haystack:
+            score += 1
+    return score
+
+
+def retrieve_curriculum_examples(vectorstore: Chroma, info: CollectedInfo, k: int = 2) -> str:
+    query = _build_curriculum_query(info)
+    candidates = _retrieve(
+        vectorstore,
+        query,
+        k=max(6, k * 3),
+        search_filter={"doc_type": {"$eq": "curriculum_example"}},
+        label="curriculum_examples",
+    )
+    ranked_docs = sorted(
+        candidates,
+        key=lambda doc: (_score_curriculum_doc(doc, info), len(doc.page_content)),
+        reverse=True,
+    )
+    selected_docs = ranked_docs[:k]
+    logger.info(
+        "[GENERATE][curriculum_examples] rerank selected=%s candidate_scores=%s",
+        len(selected_docs),
+        [_score_curriculum_doc(doc, info) for doc in selected_docs],
+    )
+    return "\n\n---\n\n".join(doc.page_content for doc in selected_docs)
+
+
+def build_chain(vectorstore: Chroma):
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)
 
     def retrieve_and_build_messages(input_dict: dict) -> list:
-        # 사용자가 준 정보와 검색 결과를 한 번에 모아, 커리큘럼 생성용 최종 메시지를 만든다.
+        started_at = perf_counter()
         conversation = input_dict["conversation"]
         info: CollectedInfo = input_dict["info"]
         groups = input_dict["groups"]
 
-        # 시간 계산을 먼저 고정해 두면, LLM이 회차별 시간을 맞출 때 흔들림이 줄어든다.
+        logger.info(
+            "[GENERATE] build messages start company=%s topic=%s level=%s conversation_messages=%s",
+            info.company_name,
+            info.topic,
+            info.level,
+            len(conversation),
+        )
+
         total_hours = info.days * info.hours_per_day
         theory_hours = round(total_hours * 0.65)
         group_hours = total_hours - theory_hours
 
-        ax_vectorstore = vectorstores["ax_compass"]
-        curriculum_vectorstore = vectorstores["curriculum_examples"]
-
         ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
+        ctx_a = retrieve_group_context(vectorstore, ga["types"], group_label="group_a")
+        ctx_b = retrieve_group_context(vectorstore, gb["types"], group_label="group_b")
+        ctx_c = retrieve_group_context(vectorstore, gc["types"], group_label="group_c")
 
-        # 각 그룹이 참고해야 할 AX Compass 특성을 따로 가져온다.
-        ctx_a = retrieve_group_context(ax_vectorstore, ga["types"])
-        ctx_b = retrieve_group_context(ax_vectorstore, gb["types"])
-        ctx_c = retrieve_group_context(ax_vectorstore, gc["types"])
+        curriculum_examples = retrieve_curriculum_examples(vectorstore, info)
 
-        # 전체 프로그램 분위기와 유사한 커리큘럼 예시도 함께 붙인다.
-        curriculum_query = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
-        curriculum_examples = retrieve_curriculum_examples(curriculum_vectorstore, curriculum_query)
-
-        # 새 시스템 프롬프트를 쓸 것이므로, 기존 대화의 SystemMessage는 제외한다.
         chat_history = [message for message in conversation if not isinstance(message, SystemMessage)]
 
-        # 검색 결과를 사람이 읽는 참고자료처럼 정리해서 마지막 HumanMessage에 넣는다.
         rag_content = dedent(
             f"""
             위 대화에서 수집한 요구사항을 바탕으로 맞춤형 교육 커리큘럼을 설계해줘.
@@ -154,6 +246,12 @@ def build_chain(vectorstores: dict[str, Chroma]):
             {curriculum_examples}
             """
         ).strip()
+        logger.info(
+            "[GENERATE] build messages done rag_chars=%s chat_history=%s elapsed=%.2fs",
+            len(rag_content),
+            len(chat_history),
+            perf_counter() - started_at,
+        )
 
         return [SystemMessage(content=GENERATION_SYSTEM_PROMPT)] + chat_history + [HumanMessage(content=rag_content)]
 
