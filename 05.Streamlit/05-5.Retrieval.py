@@ -1,4 +1,6 @@
+import logging
 import os
+from time import perf_counter
 from textwrap import dedent
 from typing import Any
 
@@ -9,6 +11,12 @@ from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 
 from schemas import CollectedInfo, CurriculumPlan, Message
+
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+logger = logging.getLogger("curriculum_backend.retrieval")
 
 
 # 이 파일은 "무엇을 찾을지"와 "찾은 내용을 어떻게 LLM에 넘길지"를 담당한다.
@@ -65,15 +73,38 @@ def to_lc_messages(messages: list[Message]) -> list:
     return [_MSG_CLS[m.role](content=m.content) for m in messages]
 
 
-def _retrieve(vectorstore: Chroma, query: str, k: int, filter: dict[str, Any] | None = None) -> list[Document]:
+def _retrieve(
+    vectorstore: Chroma,
+    query: str,
+    k: int,
+    filter: dict[str, Any] | None = None,
+    *,
+    label: str,
+) -> list[Document]:
     # 검색 공통 함수. 필요하면 메타데이터 필터까지 함께 건다.
     search_kwargs: dict[str, Any] = {"k": k}
     if filter:
         search_kwargs["filter"] = filter
-    return vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs).invoke(query)
+    logger.info(
+        "[GENERATE][%s] retrieval start k=%s filter=%s query=%s",
+        label,
+        k,
+        bool(filter),
+        query[:160],
+    )
+    started_at = perf_counter()
+    docs = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs).invoke(query)
+    logger.info(
+        "[GENERATE][%s] retrieval done docs=%s chars=%s elapsed=%.2fs",
+        label,
+        len(docs),
+        sum(len(doc.page_content) for doc in docs),
+        perf_counter() - started_at,
+    )
+    return docs
 
 
-def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
+def retrieve_group_context(vectorstore: Chroma, type_names: list[str], *, group_label: str) -> str:
     # AX Compass 쪽은 "특정 유형"만 보고 싶으므로 type_name 필터를 함께 사용한다.
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
     docs = _retrieve(
@@ -81,13 +112,14 @@ def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
         query,
         max(4, len(type_names) * 3),
         {"type_name": {"$in": type_names}},
+        label=f"{group_label}_ax",
     )
     return "\n\n".join(doc.page_content for doc in docs)
 
 
 def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
     # 커리큘럼 예시는 유사한 사례를 몇 개 가져와 생성 단계의 참고 자료로 쓴다.
-    docs = _retrieve(vectorstore, query, k)
+    docs = _retrieve(vectorstore, query, k, label="curriculum_examples")
     return "\n\n---\n\n".join(doc.page_content for doc in docs)
 
 
@@ -98,9 +130,17 @@ def build_chain(vectorstores: dict[str, Chroma]):
 
     def retrieve_and_build_messages(input_dict: dict) -> list:
         # 사용자가 준 정보와 검색 결과를 한 번에 모아, 커리큘럼 생성용 최종 메시지를 만든다.
+        started_at = perf_counter()
         conversation = input_dict["conversation"]
         info: CollectedInfo = input_dict["info"]
         groups = input_dict["groups"]
+        logger.info(
+            "[GENERATE] build messages start company=%s topic=%s level=%s conversation_messages=%s",
+            info.company_name,
+            info.topic,
+            info.level,
+            len(conversation),
+        )
 
         # 시간 계산을 먼저 고정해 두면, LLM이 회차별 시간을 맞출 때 흔들림이 줄어든다.
         total_hours = info.days * info.hours_per_day
@@ -113,9 +153,9 @@ def build_chain(vectorstores: dict[str, Chroma]):
         ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
 
         # 각 그룹이 참고해야 할 AX Compass 특성을 따로 가져온다.
-        ctx_a = retrieve_group_context(ax_vectorstore, ga["types"])
-        ctx_b = retrieve_group_context(ax_vectorstore, gb["types"])
-        ctx_c = retrieve_group_context(ax_vectorstore, gc["types"])
+        ctx_a = retrieve_group_context(ax_vectorstore, ga["types"], group_label="group_a")
+        ctx_b = retrieve_group_context(ax_vectorstore, gb["types"], group_label="group_b")
+        ctx_c = retrieve_group_context(ax_vectorstore, gc["types"], group_label="group_c")
 
         # 전체 프로그램 분위기와 유사한 커리큘럼 예시도 함께 붙인다.
         curriculum_query = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
@@ -154,6 +194,12 @@ def build_chain(vectorstores: dict[str, Chroma]):
             {curriculum_examples}
             """
         ).strip()
+        logger.info(
+            "[GENERATE] build messages done rag_chars=%s chat_history=%s elapsed=%.2fs",
+            len(rag_content),
+            len(chat_history),
+            perf_counter() - started_at,
+        )
 
         return [SystemMessage(content=GENERATION_SYSTEM_PROMPT)] + chat_history + [HumanMessage(content=rag_content)]
 

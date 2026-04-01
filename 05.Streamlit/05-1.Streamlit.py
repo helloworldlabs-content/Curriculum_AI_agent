@@ -7,6 +7,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+HEALTH_TIMEOUT_SECONDS = 10
+CHAT_TIMEOUT_SECONDS = 30
+GENERATE_TIMEOUT_SECONDS = 600
+LOGIN_TIMEOUT_SECONDS = 10
+
+
 st.set_page_config(page_title="AI 커리큘럼 설계", page_icon="◼", layout="wide")
 
 # --- CSS ---
@@ -103,14 +109,23 @@ def _url(path: str) -> str:
 @st.cache_data(ttl=30)
 def check_backend_health(token: str) -> dict | None:
     try:
-        resp = requests.get(_url("/health"), headers={"Authorization": f"Bearer {token}"}, timeout=5)
+        resp = requests.get(
+            _url("/health"),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=HEALTH_TIMEOUT_SECONDS,
+        )
         return resp.json() if resp.ok else None
     except Exception:
         return None
 
 
 def call_chat(messages: list[dict]) -> dict:
-    resp = requests.post(_url("/chat"), json={"messages": messages}, headers=_headers(), timeout=30)
+    resp = requests.post(
+        _url("/chat"),
+        json={"messages": messages},
+        headers=_headers(),
+        timeout=CHAT_TIMEOUT_SECONDS,
+    )
     resp.raise_for_status()
     return resp.json()
 
@@ -120,7 +135,7 @@ def call_generate(messages: list[dict], collected_info: dict) -> dict:
         _url("/generate"),
         json={"messages": messages, "collected_info": collected_info},
         headers=_headers(),
-        timeout=300,
+        timeout=GENERATE_TIMEOUT_SECONDS,
     )
     resp.raise_for_status()
     return resp.json()
@@ -271,7 +286,7 @@ def render_login():
             resp = requests.post(
                 _url("/auth/login"),
                 json={"username": username, "password": password},
-                timeout=10,
+                timeout=LOGIN_TIMEOUT_SECONDS,
             )
             if resp.ok:
                 st.session_state.token     = resp.json()["access_token"]

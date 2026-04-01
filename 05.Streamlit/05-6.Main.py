@@ -1,10 +1,18 @@
 import importlib.util
+import logging
 import os
 import sys
+from time import perf_counter
 
 from fastapi import Depends, FastAPI, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+logger = logging.getLogger("curriculum_backend.main")
 
 
 def _load(module_name: str, filename: str):
@@ -113,18 +121,43 @@ def chat(req: ChatRequest, _: str = Depends(verify_token)):
 
 @app.post("/generate")
 def generate(req: GenerateRequest, _: str = Depends(verify_token)):
+    started_at = perf_counter()
     try:
         info = CollectedInfo(**req.collected_info)
         conversation = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
+        groups = _build_groups(info)
+        logger.info(
+            "[GENERATE] request start company=%s topic=%s level=%s messages=%s total_hours=%s",
+            info.company_name,
+            info.topic,
+            info.level,
+            len(req.messages),
+            info.days * info.hours_per_day,
+        )
+        logger.info(
+            "[GENERATE] group counts A=%s B=%s C=%s",
+            groups["group_a"]["count"],
+            groups["group_b"]["count"],
+            groups["group_c"]["count"],
+        )
+        logger.info("[GENERATE] chain invoke start")
         result: CurriculumPlan = _chain.invoke(
             {
                 "conversation": conversation,
                 "info": info,
-                "groups": _build_groups(info),
+                "groups": groups,
             }
+        )
+        logger.info(
+            "[GENERATE] chain invoke done elapsed=%.2fs title=%s theory_sessions=%s group_sessions=%s",
+            perf_counter() - started_at,
+            result.program_title,
+            len(result.theory_sessions),
+            len(result.group_sessions),
         )
         return result.model_dump()
     except Exception as e:
+        logger.exception("[GENERATE] request failed after %.2fs: %s", perf_counter() - started_at, e)
         raise HTTPException(status_code=500, detail=str(e))
 
 

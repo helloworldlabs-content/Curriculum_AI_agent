@@ -29,11 +29,11 @@ EXPOSE 8000
 
 # Gunicorn + uvicorn worker 설정
 # --preload: 마스터에서 앱 로드 후 포크 → VectorDB 초기화 1회만 실행
-# --timeout 300: LLM 생성 시간 고려
+# --timeout 600: LLM 생성 시간과 배포 환경 지연을 함께 고려
 # --workers: CPU * 2 + 1 공식 기준 (조정 가능)
 CMD ["gunicorn", "main:app", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--workers", "4", \
      "--bind", "0.0.0.0:8000", \
      "--preload", \
-     "--timeout", "300"]
+     "--timeout", "600"]
