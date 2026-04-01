@@ -97,10 +97,11 @@ def _url(path: str) -> str:
 
 
 
+# token을 파라미터로 받아야 캐시 키에 포함되어 토큰 교체 시 올바르게 재조회한다.
 @st.cache_data(ttl=30)
-def check_backend_health() -> dict | None:
+def check_backend_health(token: str) -> dict | None:
     try:
-        resp = requests.get(_url("/health"), headers=_headers(), timeout=5)
+        resp = requests.get(_url("/health"), headers={"Authorization": f"Bearer {token}"}, timeout=5)
         return resp.json() if resp.ok else None
     except Exception:
         return None
@@ -247,7 +248,7 @@ def render_sidebar():
 
         st.markdown('<hr style="border-color:#333;margin:16px 0;">', unsafe_allow_html=True)
         st.markdown('<div style="font-size:11px;color:#777;letter-spacing:1px;margin-bottom:8px;">BACKEND</div>', unsafe_allow_html=True)
-        health = check_backend_health()
+        health = check_backend_health(st.session_state.get("token", ""))
         if health:
             st.markdown(f'<div style="color:#aaaaaa;font-size:13px;">✓ 연결됨 ({health["chunks"]}개 청크)</div>', unsafe_allow_html=True)
         else:
@@ -283,20 +284,20 @@ def render_login():
 # --- 메인 ---
 
 def main():
+    init_session_state()
+
     if not st.session_state.get("logged_in"):
         render_login()
         return
+
+    apply_custom_css()
+    render_sidebar()
 
     # 사이드바 로그아웃
     with st.sidebar:
         if st.button("로그아웃", use_container_width=True):
             st.session_state.logged_in = False
             st.rerun()
-
-
-    apply_custom_css()
-    init_session_state()
-    render_sidebar()
 
     status = "완료" if st.session_state.curriculum else ("생성 중" if st.session_state.generating else "대화 중")
     st.markdown(
