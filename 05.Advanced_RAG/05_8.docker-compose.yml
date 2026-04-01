@@ -4,13 +4,13 @@
 services:
   backend:
     build:
-      context: ..                          # 빌드 컨텍스트: 프로젝트 루트
+      context: ..
       dockerfile: 05.Advanced_RAG/05_7.Dockerfile
     ports:
       - "8000:8000"
     volumes:
-      - ../Data:/app/Data                  # PDF 및 캐시 파일 유지
-      - ../vectorDB:/app/vectorDB          # 벡터 DB 영구 저장
+      - ../Data:/app/Data
+      - ../vectorDB:/app/vectorDB
     env_file:
-      - ../.env                            # OPENAI_API_KEY, BACKEND_API_KEY
+      - ../.env
     restart: unless-stopped
