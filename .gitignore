@@ -2,3 +2,4 @@
 .venv
 vectorDB
 */__pycache__/*
+*/*_EvaluationReport.md
