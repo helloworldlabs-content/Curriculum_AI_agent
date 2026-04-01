@@ -10,11 +10,11 @@ COPY requirements.txt ./requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 앱 소스 복사 (파일명 하이픈으로 인해 importlib 사용 — 원본 파일명 유지)
-# 05-5.main.py는 gunicorn 모듈명 호환을 위해 main.py로 복사
-COPY 05.Streamlit/05-2.schemas.py ./05-2.schemas.py
-COPY 05.Streamlit/05-3.auth.py    ./05-3.auth.py
-COPY 05.Streamlit/05-4.rag.py     ./05-4.rag.py
-COPY 05.Streamlit/05-5.main.py    ./main.py
+# 05-5.Main.py는 gunicorn 모듈명 호환을 위해 main.py로 복사
+COPY 05.Streamlit/05-2.Schemas.py ./05-2.Schemas.py
+COPY 05.Streamlit/05-3.Auth.py    ./05-3.Auth.py
+COPY 05.Streamlit/05-4.Rag.py     ./05-4.Rag.py
+COPY 05.Streamlit/05-5.Main.py    ./main.py
 
 # PDF 및 캐시 파일 복사
 COPY Data/ ./Data/

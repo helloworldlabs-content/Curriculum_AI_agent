@@ -11,9 +11,9 @@ def _load(filename: str):
     spec.loader.exec_module(mod)
     return mod
 
-_schemas = _load("05-2.schemas.py")
-_auth    = _load("05-3.auth.py")
-_rag     = _load("05-4.rag.py")
+_schemas = _load("05-2.Schemas.py")
+_auth    = _load("05-3.Auth.py")
+_rag     = _load("05-4.Rag.py")
 
 # schemas
 Message          = _schemas.Message
@@ -108,4 +108,4 @@ def generate(req: GenerateRequest, _: str = Depends(verify_token)):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("05-2.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
