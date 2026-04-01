@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from time import perf_counter
 from textwrap import dedent
 
@@ -114,15 +115,75 @@ def retrieve_group_context(vectorstore: Chroma, type_names: list[str], *, group_
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
-    docs = _retrieve(
+def _keyword_tokens(*texts: str) -> list[str]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for text in texts:
+        for token in re.findall(r"[0-9A-Za-z가-힣+#/.]{2,}", text or ""):
+            lowered = token.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            tokens.append(token)
+    return tokens
+
+
+def _build_curriculum_query(info: CollectedInfo) -> str:
+    return dedent(
+        f"""
+        기업 맞춤형 AI 교육 커리큘럼 예시를 찾는다.
+        강의 주제: {info.topic}
+        교육 목표: {info.goal}
+        교육 대상자: {info.audience}
+        현재 수준: {info.level}
+        반영 조건 및 제한사항: {info.constraints}
+        총 교육 시간: {info.days * info.hours_per_day}시간
+        실무 적용 중심의 기업 교육 사례
+        """
+    ).strip()
+
+
+def _score_curriculum_doc(doc, info: CollectedInfo) -> int:
+    haystack = " ".join(
+        [
+            doc.page_content,
+            str(doc.metadata.get("course_name", "")),
+        ]
+    ).lower()
+    primary_tokens = _keyword_tokens(info.topic, info.goal)
+    secondary_tokens = _keyword_tokens(info.audience, info.level, info.constraints)
+
+    score = 0
+    for token in primary_tokens:
+        if token.lower() in haystack:
+            score += 3
+    for token in secondary_tokens:
+        if token.lower() in haystack:
+            score += 1
+    return score
+
+
+def retrieve_curriculum_examples(vectorstore: Chroma, info: CollectedInfo, k: int = 2) -> str:
+    query = _build_curriculum_query(info)
+    candidates = _retrieve(
         vectorstore,
         query,
-        k=k,
+        k=max(6, k * 3),
         search_filter={"doc_type": {"$eq": "curriculum_example"}},
         label="curriculum_examples",
     )
-    return "\n\n---\n\n".join(doc.page_content for doc in docs)
+    ranked_docs = sorted(
+        candidates,
+        key=lambda doc: (_score_curriculum_doc(doc, info), len(doc.page_content)),
+        reverse=True,
+    )
+    selected_docs = ranked_docs[:k]
+    logger.info(
+        "[GENERATE][curriculum_examples] rerank selected=%s candidate_scores=%s",
+        len(selected_docs),
+        [_score_curriculum_doc(doc, info) for doc in selected_docs],
+    )
+    return "\n\n---\n\n".join(doc.page_content for doc in selected_docs)
 
 
 def build_chain(vectorstore: Chroma):
@@ -152,8 +213,7 @@ def build_chain(vectorstore: Chroma):
         ctx_b = retrieve_group_context(vectorstore, gb["types"], group_label="group_b")
         ctx_c = retrieve_group_context(vectorstore, gc["types"], group_label="group_c")
 
-        curriculum_query = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
-        curriculum_examples = retrieve_curriculum_examples(vectorstore, curriculum_query)
+        curriculum_examples = retrieve_curriculum_examples(vectorstore, info)
 
         chat_history = [message for message in conversation if not isinstance(message, SystemMessage)]
 
