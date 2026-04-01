@@ -146,7 +146,8 @@ def _build_structured_document(content: str, metadata: dict[str, Any]) -> Docume
 
 def _annotate_chunks(chunks: list[Document]) -> list[Document]:
     # 각 청크에 추적용 메타데이터를 붙여 둔다.
-    # chunk_id / content_hash는 중복 방지나 이후 증분 인덱싱의 기반이 된다.
+    # base_hash는 "contextual 적용 전 원본 청크" 기준 해시다.
+    # 이후 증분 인덱싱에서는 이 값을 기준으로 새 청크인지 먼저 판단한다.
     source_counters: dict[tuple[str, str, str], int] = {}
     for chunk in chunks:
         source_key = (
@@ -157,14 +158,16 @@ def _annotate_chunks(chunks: list[Document]) -> list[Document]:
         chunk_index = source_counters.get(source_key, 0)
         source_counters[source_key] = chunk_index + 1
 
-        content_hash = _short_hash(chunk.page_content)
+        base_hash = _short_hash(chunk.page_content)
         chunk.metadata.update(
             {
                 "chunk_index": chunk_index,
-                "chunk_id": f"{chunk.metadata.get('source_name', 'doc')}:{chunk_index}:{content_hash}",
-                "content_hash": content_hash,
+                "chunk_id": f"{chunk.metadata.get('source_name', 'doc')}:{chunk_index}:{base_hash}",
+                "base_hash": base_hash,
+                "content_hash": base_hash,
                 "word_count": len(chunk.page_content.split()),
                 "indexed_at": datetime.now(timezone.utc).isoformat(),
+                "contextual": False,
             }
         )
         if chunk.metadata.get("doc_type") == "ax_compass":
@@ -216,6 +219,7 @@ def _apply_contextual_retrieval(
                     page_content=new_content,
                     metadata={
                         **chunk.metadata,
+                        "base_hash": chunk.metadata.get("content_hash"),  # 중복 방지용 원본 해시
                         "content_hash": new_hash,
                         "chunk_id": "{}:{}:{}".format(
                             chunk.metadata.get("source_name", "doc"),
@@ -247,6 +251,26 @@ def _split_documents_with_strategy(
         separators=["\n[content]", "\n\n", "\n", " "],
     )
     return _annotate_chunks(splitter.split_documents(docs))
+
+
+def _build_ax_compass_chunk_bundle() -> tuple[list[Document], list[Document]]:
+    docs = load_ax_compass_documents()
+    chunks = _split_documents_with_strategy(
+        docs,
+        chunk_size=AX_CHUNK_SIZE,
+        chunk_overlap=AX_CHUNK_OVERLAP,
+    )
+    return docs, chunks
+
+
+def _build_curriculum_chunk_bundle() -> tuple[list[Document], list[Document]]:
+    docs = load_curriculum_pdf_documents() + load_curriculum_excel_documents()
+    chunks = _split_documents_with_strategy(
+        docs,
+        chunk_size=CURRICULUM_CHUNK_SIZE,
+        chunk_overlap=CURRICULUM_CHUNK_OVERLAP,
+    )
+    return docs, chunks
 
 
 def _load_pdf_pages(fpath: str, metadata_builder) -> list[Document]:
@@ -357,12 +381,7 @@ def load_curriculum_excel_documents() -> list[Document]:
 
 def load_ax_compass_chunks(contextual: bool = False) -> list[Document]:
     # AX Compass는 설명형 문서라 청크를 조금 더 크게 잡는다.
-    docs = load_ax_compass_documents()
-    chunks = _split_documents_with_strategy(
-        docs,
-        chunk_size=AX_CHUNK_SIZE,
-        chunk_overlap=AX_CHUNK_OVERLAP,
-    )
+    docs, chunks = _build_ax_compass_chunk_bundle()
     if contextual:
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
         print(f"[ContextualRetrieval] AX Compass 맥락 생성 중... ({len(chunks)}개 청크)")
@@ -373,12 +392,7 @@ def load_ax_compass_chunks(contextual: bool = False) -> list[Document]:
 
 def load_curriculum_chunks(contextual: bool = False) -> list[Document]:
     # 커리큘럼 예시는 세션 단위 정보가 많아서 AX Compass보다 약간 더 촘촘하게 자른다.
-    docs = load_curriculum_pdf_documents() + load_curriculum_excel_documents()
-    chunks = _split_documents_with_strategy(
-        docs,
-        chunk_size=CURRICULUM_CHUNK_SIZE,
-        chunk_overlap=CURRICULUM_CHUNK_OVERLAP,
-    )
+    docs, chunks = _build_curriculum_chunk_bundle()
     if contextual:
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
         print(f"[ContextualRetrieval] 커리큘럼 맥락 생성 중... ({len(chunks)}개 청크)")
@@ -400,40 +414,58 @@ def _create_vector_store(embeddings: OpenAIEmbeddings, collection_name: str) -> 
     )
 
 
-def _get_indexed_hashes(vectorstore: Chroma) -> set[str]:
-    # 이미 들어간 청크의 해시를 읽어 와서, 같은 내용이 다시 들어가지 않도록 한다.
+def _get_indexed_hashes(vectorstore: Chroma, field_name: str = "content_hash") -> set[str]:
+    # 저장된 메타데이터에서 특정 해시 필드를 읽어 온다.
+    # contextual 적용 여부와 관계없이 비교할 수 있도록 base_hash / content_hash를 구분해 쓴다.
     try:
         result = vectorstore._collection.get(include=["metadatas"])
     except Exception:
         return set()
 
     return {
-        metadata.get("content_hash", "")
+        metadata.get(field_name, "")
         for metadata in result.get("metadatas", [])
-        if metadata and metadata.get("content_hash")
+        if metadata and metadata.get(field_name)
     }
 
 
-def _filter_new_documents(docs: list[Document], indexed_hashes: set[str]) -> list[Document]:
-    return [doc for doc in docs if doc.metadata.get("content_hash", "") not in indexed_hashes]
+def _filter_new_documents(
+    docs: list[Document],
+    indexed_hashes: set[str],
+    *,
+    field_name: str = "content_hash",
+) -> list[Document]:
+    return [doc for doc in docs if doc.metadata.get(field_name, "") not in indexed_hashes]
 
 
-def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
+def _ensure_index(vectorstore: Chroma, loader, label: str, *, contextual: bool = False) -> None:
     # 첫 실행이면 전체 인덱싱, 이후에는 새 해시만 추가한다.
     # 아직 "수정/삭제 동기화"까지는 아니지만, 완전 재색인보다 훨씬 가볍게 시작할 수 있다.
     existing_count = _collection_count(vectorstore)
-    chunks = loader()
+    source_docs, chunks = loader()
 
     if existing_count == 0:
         print(f"[VectorDB] {label} 컬렉션 인덱싱 중...")
+        if contextual and chunks:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+            print(f"[ContextualRetrieval] {label} 맥락 생성 중... ({len(chunks)}개 청크)")
+            chunks = _apply_contextual_retrieval(source_docs, chunks, llm)
         if chunks:
             vectorstore.add_documents(chunks)
         print(f"[VectorDB] {label} 컬렉션 완료 ({len(chunks)}개 청크)")
         return
 
-    indexed_hashes = _get_indexed_hashes(vectorstore)
-    new_chunks = _filter_new_documents(chunks, indexed_hashes)
+    indexed_base_hashes = _get_indexed_hashes(vectorstore, field_name="base_hash")
+    if not indexed_base_hashes:
+        indexed_base_hashes = _get_indexed_hashes(vectorstore, field_name="content_hash")
+
+    # 베이스 청크의 content_hash를 저장된 base_hash와 비교한다.
+    new_chunks = _filter_new_documents(chunks, indexed_base_hashes, field_name="content_hash")
     if new_chunks:
+        if contextual:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+            print(f"[ContextualRetrieval] {label} 신규 청크 맥락 생성 중... ({len(new_chunks)}개 청크)")
+            new_chunks = _apply_contextual_retrieval(source_docs, new_chunks, llm)
         print(f"[VectorDB] {label} 신규 청크 {len(new_chunks)}개 추가 중...")
         vectorstore.add_documents(new_chunks)
         print(f"[VectorDB] {label} 추가 완료 ({_collection_count(vectorstore)}개 청크)")
@@ -451,8 +483,8 @@ def setup_vector_stores(contextual: bool = False) -> dict[str, Chroma]:
     ax_store = _create_vector_store(embeddings, AX_COLLECTION_NAME)
     curriculum_store = _create_vector_store(embeddings, CURRICULUM_COLLECTION_NAME)
 
-    _ensure_index(ax_store, lambda: load_ax_compass_chunks(contextual=contextual), "AX Compass")
-    _ensure_index(curriculum_store, lambda: load_curriculum_chunks(contextual=contextual), "커리큘럼 예시")
+    _ensure_index(ax_store, _build_ax_compass_chunk_bundle, "AX Compass", contextual=contextual)
+    _ensure_index(curriculum_store, _build_curriculum_chunk_bundle, "커리큘럼 예시", contextual=contextual)
 
     return {
         "ax_compass": ax_store,

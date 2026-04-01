@@ -93,7 +93,9 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 def _url(path: str) -> str:
-    return os.getenv("BACKEND_URL", "").rstrip("/") + path
+    # Trim spaces to avoid malformed URLs like " https://...".
+    base_url = os.getenv("BACKEND_URL", "").strip().rstrip("/")
+    return base_url + path
 
 
 
