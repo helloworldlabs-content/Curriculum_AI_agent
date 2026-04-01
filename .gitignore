@@ -1,3 +1,4 @@
 .env
 .venv
 vectorDB
+*/__pycache__/*
