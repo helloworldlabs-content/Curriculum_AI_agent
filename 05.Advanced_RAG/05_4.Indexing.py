@@ -30,7 +30,7 @@ TYPE_INFO = {
     "이해형": {"group": "A", "english": "LEARNER"},
     "과신형": {"group": "B", "english": "OVERCONFIDENT"},
     "실행형": {"group": "B", "english": "DOER"},
-    "진단형": {"group": "C", "english": "ANALYST"},
+    "판단형": {"group": "C", "english": "ANALYST"},
     "조심형": {"group": "C", "english": "CAUTIOUS"},
 }
 
