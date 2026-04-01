@@ -1,11 +1,11 @@
-# 실행: docker-compose -f 05.Streamlit/05-7.docker-compose.yml up --build
-# 중지: docker-compose -f 05.Streamlit/05-7.docker-compose.yml down
+# 실행: docker-compose -f 05.Streamlit/05_8.docker-compose.yml up --build
+# 중지: docker-compose -f 05.Streamlit/05_8.docker-compose.yml down
 
 services:
   backend:
     build:
       context: ..                          # 빌드 컨텍스트: 프로젝트 루트
-      dockerfile: 05.Streamlit/05-6.Dockerfile
+      dockerfile: 05.Streamlit/05_7.Dockerfile
     ports:
       - "8000:8000"
     volumes:
