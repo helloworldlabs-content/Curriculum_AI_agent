@@ -1,10 +1,18 @@
 import importlib.util
+import logging
 import os
 import sys
+from time import perf_counter
 
 from fastapi import Depends, FastAPI, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
+
+logger = logging.getLogger("curriculum_backend.main")
 
 
 def _load(module_name: str, filename: str):
@@ -16,10 +24,10 @@ def _load(module_name: str, filename: str):
     return module
 
 
-_schemas = _load("schemas", "05-2.Schemas.py")
-_auth = _load("auth", "05-3.Auth.py")
-_indexing = _load("indexing", "05-4.Indexing.py")
-_retrieval = _load("retrieval", "05-5.Retrieval.py")
+_schemas = _load("schemas", "05_2.Schemas.py")
+_auth = _load("auth", "05_3.Auth.py")
+_indexing = _load("indexing", "05_4.Indexing.py")
+_retrieval = _load("retrieval", "05_5.Retrieval.py")
 
 
 Message = _schemas.Message
@@ -38,12 +46,12 @@ authenticate = _auth.authenticate
 COLLECTION_SYSTEM_PROMPT = _retrieval.COLLECTION_SYSTEM_PROMPT
 to_lc_messages = _retrieval.to_lc_messages
 build_chain = _retrieval.build_chain
-setup_vector_stores = _indexing.setup_vector_stores
+setup_vector_store = _indexing.setup_vector_store
 
 
 _llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-_vectorstores = setup_vector_stores()
-_chain = build_chain(_vectorstores)
+_vectorstore = setup_vector_store()
+_chain = build_chain(_vectorstore)
 
 app = FastAPI(title="AI Curriculum Backend")
 
@@ -77,8 +85,7 @@ def login(req: LoginRequest):
 
 @app.get("/health")
 def health(_: str = Depends(verify_token)):
-    collections = {name: store._collection.count() for name, store in _vectorstores.items()}
-    return {"status": "ok", "chunks": sum(collections.values()), "collections": collections}
+    return {"status": "ok", "chunks": _vectorstore._collection.count()}
 
 
 @app.post("/chat", response_model=ChatResponse)
@@ -100,25 +107,50 @@ def chat(req: ChatRequest, _: str = Depends(verify_token)):
             collected_info = info.model_dump()
 
         return ChatResponse(reply=reply, complete=complete, collected_info=collected_info)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error))
 
 
 @app.post("/generate")
 def generate(req: GenerateRequest, _: str = Depends(verify_token)):
+    started_at = perf_counter()
     try:
         info = CollectedInfo(**req.collected_info)
+        groups = _build_groups(info)
         conversation = [SystemMessage(content=COLLECTION_SYSTEM_PROMPT)] + to_lc_messages(req.messages)
+        logger.info(
+            "[GENERATE] request start company=%s topic=%s level=%s messages=%s total_hours=%s",
+            info.company_name,
+            info.topic,
+            info.level,
+            len(req.messages),
+            info.days * info.hours_per_day,
+        )
+        logger.info(
+            "[GENERATE] group counts A=%s B=%s C=%s",
+            groups["group_a"]["count"],
+            groups["group_b"]["count"],
+            groups["group_c"]["count"],
+        )
+        logger.info("[GENERATE] chain invoke start")
         result: CurriculumPlan = _chain.invoke(
             {
                 "conversation": conversation,
                 "info": info,
-                "groups": _build_groups(info),
+                "groups": groups,
             }
         )
+        logger.info(
+            "[GENERATE] chain invoke done elapsed=%.2fs title=%s theory_sessions=%s group_sessions=%s",
+            perf_counter() - started_at,
+            result.program_title,
+            len(result.theory_sessions),
+            len(result.group_sessions),
+        )
         return result.model_dump()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as error:
+        logger.exception("[GENERATE] request failed after %.2fs: %s", perf_counter() - started_at, error)
+        raise HTTPException(status_code=500, detail=str(error))
 
 
 if __name__ == "__main__":
