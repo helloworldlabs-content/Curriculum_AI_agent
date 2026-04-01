@@ -76,22 +76,22 @@ def _tokenize_for_bm25(text: str) -> list[str]:
 
 
 def _display_text(doc: Document) -> str:
-    # 최종적으로 보여 주거나 LLM에 넣을 텍스트를 꺼낸다.
+    # 최종적으로 사용자나 LLM에 보여 줄 텍스트를 꺼낸다.
     return str(doc.metadata.get("display_text") or doc.page_content)
 
 
 def _bm25_text(doc: Document) -> str:
-    # BM25 키워드 검색에 쓸 전용 텍스트를 꺼낸다.
+    # BM25 키워드 검색에만 쓸 전용 텍스트를 꺼낸다.
     return str(doc.metadata.get("bm25_text") or doc.page_content)
 
 
 def _as_display_doc(doc: Document) -> Document:
-    # 검색용 문서를 "보여 주는 텍스트 기준" 문서로 바꿔 결과 사용을 단순하게 만든다.
+    # 검색 결과는 마지막에 display_text 기준으로 쓰기 쉽게 맞춰 둔다.
     return Document(page_content=_display_text(doc), metadata=doc.metadata)
 
 
 def _doc_identity(doc: Document) -> str:
-    # 같은 문서를 벡터 검색과 BM25가 각각 찾더라도 하나로 합칠 수 있게 고유 키를 만든다.
+    # dense/sparse 검색이 같은 문서를 찾았을 때 하나로 합치기 위한 ID다.
     metadata = doc.metadata or {}
     return str(
         metadata.get("chunk_id")
@@ -102,7 +102,7 @@ def _doc_identity(doc: Document) -> str:
 
 
 def _search_filter_key(search_filter: dict) -> str:
-    # dict 형태의 필터를 캐시 키로 쓰기 위해 문자열로 바꾼다.
+    # dict는 바로 캐시 키로 쓰기 어려워서 문자열로 바꾼다.
     return json.dumps(search_filter, sort_keys=True, ensure_ascii=False)
 
 
@@ -111,7 +111,7 @@ def _load_filtered_docs(
     search_filter: dict,
     cache: dict[str, list[Document]],
 ) -> list[Document]:
-    # BM25는 필터에 맞는 후보 문서를 먼저 모은 뒤 그 안에서 점수를 계산한다.
+    # BM25는 필터에 맞는 문서 후보를 먼저 모은 뒤 그 안에서 점수를 계산한다.
     cache_key = _search_filter_key(search_filter)
     if cache_key in cache:
         return cache[cache_key]
@@ -132,7 +132,7 @@ def _load_filtered_docs(
 
 
 def _bm25_search(candidate_docs: list[Document], query: str, *, k: int) -> list[Document]:
-    # 필터에 맞는 후보 문서들 안에서 BM25 점수로 상위 문서를 고른다.
+    # 필터에 맞는 후보들 안에서 BM25 점수로 상위 문서를 고른다.
     if not candidate_docs:
         return []
 
@@ -148,7 +148,7 @@ def _bm25_search(candidate_docs: list[Document], query: str, *, k: int) -> list[
 
 
 def _hybrid_fuse(dense_docs: list[Document], sparse_docs: list[Document], *, k: int) -> list[Document]:
-    # 벡터 검색과 키워드 검색을 섞어 의미 유사도와 정확 키워드 매칭을 함께 반영한다.
+    # 벡터 검색과 BM25 검색 결과를 섞어 최종 순위를 만든다.
     fused_scores: dict[str, float] = {}
     doc_lookup: dict[str, Document] = {}
 
@@ -175,7 +175,7 @@ def _retrieve(
     label: str,
     corpus_cache: dict[str, list[Document]],
 ):
-    # 실제 하이브리드 검색 진입점이다.
+    # 실제 Hybrid Search 진입점이다.
     # 1) 벡터 검색 2) BM25 검색 3) 둘을 합치기 순서로 동작한다.
     logger.info("[GENERATE][%s] retrieval start k=%s query=%s", label, k, query[:160])
     started_at = perf_counter()
@@ -289,7 +289,7 @@ def retrieve_curriculum_examples(
     k: int = 2,
     corpus_cache: dict[str, list[Document]],
 ) -> str:
-    # 커리큘럼 예시는 하이브리드 검색 후 한 번 더 재정렬해서 정말 참고할 문서만 남긴다.
+    # 커리큘럼 예시는 Hybrid Search 후 한 번 더 재정렬해서 정말 참고할 문서만 남긴다.
     query = _build_curriculum_query(info)
     candidates = _retrieve(
         vectorstore,
@@ -299,16 +299,21 @@ def retrieve_curriculum_examples(
         label="curriculum_examples",
         corpus_cache=corpus_cache,
     )
+    scored_docs = [
+        (doc, _score_curriculum_doc(doc, info))
+        for doc in candidates
+    ]
     ranked_docs = sorted(
-        candidates,
-        key=lambda doc: (_score_curriculum_doc(doc, info), len(doc.page_content)),
+        scored_docs,
+        key=lambda item: (item[1], len(item[0].page_content)),
         reverse=True,
     )
-    selected_docs = ranked_docs[:k]
+    selected_docs = [doc for doc, _score in ranked_docs[:k]]
+    selected_scores = [score for _doc, score in ranked_docs[:k]]
     logger.info(
         "[GENERATE][curriculum_examples] rerank selected=%s candidate_scores=%s",
         len(selected_docs),
-        [_score_curriculum_doc(doc, info) for doc in selected_docs],
+        selected_scores,
     )
     return "\n\n---\n\n".join(doc.page_content for doc in selected_docs)
 
