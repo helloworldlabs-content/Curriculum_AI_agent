@@ -1,12 +1,13 @@
 import hashlib
 import os
 from datetime import datetime, timezone
+from textwrap import dedent
 from typing import Any
 
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -16,8 +17,8 @@ DATA_DIR = os.path.join(BASE_DIR, "Data")
 PDF_PATH = os.path.join(DATA_DIR, "AXCompass.pdf")
 VECTOR_DB_PATH = os.path.join(BASE_DIR, "vectorDB")
 
-AX_COLLECTION_NAME = "ax_compass_profiles_v3"
-CURRICULUM_COLLECTION_NAME = "curriculum_examples_v3"
+AX_COLLECTION_NAME = "ax_compass_profiles_v4_contextual"
+CURRICULUM_COLLECTION_NAME = "curriculum_examples_v4_contextual"
 
 AX_CHUNK_SIZE = 900
 AX_CHUNK_OVERLAP = 120
@@ -171,6 +172,65 @@ def _annotate_chunks(chunks: list[Document]) -> list[Document]:
     return chunks
 
 
+CONTEXTUAL_PROMPT = dedent(
+    """
+    <document>
+    {document}
+    </document>
+    다음은 위 문서에서 추출한 청크입니다. 검색 성능을 높이기 위해 이 청크를 전체 문서 맥락 안에서 간결하게 설명하라. 설명만 출력해라.
+    <chunk>
+    {chunk}
+    </chunk>
+    """
+).strip()
+
+
+def _doc_key(metadata: dict) -> str:
+    # 청크 → 원본 문서를 찾는 데 쓰는 키. page_number 우선, 없으면 sheet_name.
+    return "{}|{}".format(
+        metadata.get("source_file", ""),
+        metadata.get("page_number") or metadata.get("sheet_name") or "",
+    )
+
+
+def _apply_contextual_retrieval(
+    source_docs: list[Document],
+    chunks: list[Document],
+    llm: ChatOpenAI,
+) -> list[Document]:
+    # 각 청크에 대해 원본 문서 전체를 참고해 맥락 요약을 생성하고, [context] 태그로 앞에 붙인다.
+    # 청크가 잘려도 "이 청크가 전체 문서의 어느 부분인지" 정보가 임베딩에 함께 반영된다.
+    doc_map = {_doc_key(doc.metadata): doc.page_content for doc in source_docs}
+    enriched: list[Document] = []
+    for chunk in chunks:
+        full_text = doc_map.get(_doc_key(chunk.metadata), "")
+        if full_text:
+            try:
+                response = llm.invoke(
+                    CONTEXTUAL_PROMPT.format(document=full_text, chunk=chunk.page_content)
+                )
+                context = response.content.strip()
+                new_content = f"[context] {context}\n{chunk.page_content}"
+                new_hash = _short_hash(new_content)
+                chunk = Document(
+                    page_content=new_content,
+                    metadata={
+                        **chunk.metadata,
+                        "content_hash": new_hash,
+                        "chunk_id": "{}:{}:{}".format(
+                            chunk.metadata.get("source_name", "doc"),
+                            chunk.metadata.get("chunk_index", 0),
+                            new_hash,
+                        ),
+                        "contextual": True,
+                    },
+                )
+            except Exception as exc:
+                print(f"[ContextualRetrieval] 맥락 생성 실패: {exc}")
+        enriched.append(chunk)
+    return enriched
+
+
 def _split_documents_with_strategy(
     docs: list[Document],
     *,
@@ -295,7 +355,7 @@ def load_curriculum_excel_documents() -> list[Document]:
     return documents
 
 
-def load_ax_compass_chunks() -> list[Document]:
+def load_ax_compass_chunks(contextual: bool = False) -> list[Document]:
     # AX Compass는 설명형 문서라 청크를 조금 더 크게 잡는다.
     docs = load_ax_compass_documents()
     chunks = _split_documents_with_strategy(
@@ -303,11 +363,15 @@ def load_ax_compass_chunks() -> list[Document]:
         chunk_size=AX_CHUNK_SIZE,
         chunk_overlap=AX_CHUNK_OVERLAP,
     )
+    if contextual:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+        print(f"[ContextualRetrieval] AX Compass 맥락 생성 중... ({len(chunks)}개 청크)")
+        chunks = _apply_contextual_retrieval(docs, chunks, llm)
     print(f"[RAG] AX Compass 청크 수: {len(chunks)}")
     return chunks
 
 
-def load_curriculum_chunks() -> list[Document]:
+def load_curriculum_chunks(contextual: bool = False) -> list[Document]:
     # 커리큘럼 예시는 세션 단위 정보가 많아서 AX Compass보다 약간 더 촘촘하게 자른다.
     docs = load_curriculum_pdf_documents() + load_curriculum_excel_documents()
     chunks = _split_documents_with_strategy(
@@ -315,6 +379,10 @@ def load_curriculum_chunks() -> list[Document]:
         chunk_size=CURRICULUM_CHUNK_SIZE,
         chunk_overlap=CURRICULUM_CHUNK_OVERLAP,
     )
+    if contextual:
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
+        print(f"[ContextualRetrieval] 커리큘럼 맥락 생성 중... ({len(chunks)}개 청크)")
+        chunks = _apply_contextual_retrieval(docs, chunks, llm)
     print(f"[RAG] 커리큘럼 예시 청크 수: {len(chunks)}")
     return chunks
 
@@ -373,8 +441,9 @@ def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
         print(f"[VectorDB] {label} 변경 없음. 기존 컬렉션 유지 ({existing_count}개 청크)")
 
 
-def setup_vector_stores() -> dict[str, Chroma]:
+def setup_vector_stores(contextual: bool = False) -> dict[str, Chroma]:
     # 문서 성격이 다른 두 컬렉션을 분리해 두면 검색 의도를 더 명확하게 나눌 수 있다.
+    # contextual=True 이면 각 청크 앞에 LLM이 생성한 맥락 요약이 붙어 검색 정확도가 올라간다.
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         api_key=os.getenv("OPENAI_API_KEY"),
@@ -382,8 +451,8 @@ def setup_vector_stores() -> dict[str, Chroma]:
     ax_store = _create_vector_store(embeddings, AX_COLLECTION_NAME)
     curriculum_store = _create_vector_store(embeddings, CURRICULUM_COLLECTION_NAME)
 
-    _ensure_index(ax_store, load_ax_compass_chunks, "AX Compass")
-    _ensure_index(curriculum_store, load_curriculum_chunks, "커리큘럼 예시")
+    _ensure_index(ax_store, lambda: load_ax_compass_chunks(contextual=contextual), "AX Compass")
+    _ensure_index(curriculum_store, lambda: load_curriculum_chunks(contextual=contextual), "커리큘럼 예시")
 
     return {
         "ax_compass": ax_store,
@@ -391,5 +460,5 @@ def setup_vector_stores() -> dict[str, Chroma]:
     }
 
 
-def setup_vector_store():
-    return setup_vector_stores()
+def setup_vector_store(contextual: bool = False):
+    return setup_vector_stores(contextual=contextual)

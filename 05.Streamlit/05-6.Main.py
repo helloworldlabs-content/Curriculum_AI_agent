@@ -42,7 +42,7 @@ setup_vector_stores = _indexing.setup_vector_stores
 
 
 _llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-_vectorstores = setup_vector_stores()
+_vectorstores = setup_vector_stores(contextual=True)
 _chain = build_chain(_vectorstores)
 
 app = FastAPI(title="AI Curriculum Backend")
