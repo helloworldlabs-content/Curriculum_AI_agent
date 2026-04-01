@@ -6,7 +6,7 @@ from typing import Any
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
 from langchain_core.documents import Document
-from langchain_openai import OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 
@@ -15,11 +15,21 @@ DATA_DIR = os.path.join(BASE_DIR, "Data")
 PDF_PATH = os.path.join(DATA_DIR, "AXCompass.pdf")
 VECTOR_DB_PATH = os.path.join(BASE_DIR, "vectorDB")
 
-# 인덱싱 방식이 바뀌었으므로 컬렉션 이름도 새 버전으로 올린다.
-# 이렇게 하면 예전 포맷 청크와 새 포맷 청크가 뒤섞이지 않는다.
-COLLECTION_NAME = "advanced_rag_v3"
 
-# 문서 성격이 다르므로 청크 전략도 분리한다.
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Contextual Retrieval을 켜면 청크 앞에 "이 청크가 문서 전체에서 어떤 의미인지" 요약을 붙인다.
+# 컬렉션 이름을 분리해 두면 기존 인덱스와 섞이지 않는다.
+USE_CONTEXTUAL_RETRIEVAL = _env_flag("USE_CONTEXTUAL_RETRIEVAL", default=True)
+COLLECTION_NAME = "advanced_rag_v4_contextual" if USE_CONTEXTUAL_RETRIEVAL else "advanced_rag_v3"
+CONTEXTUAL_MODEL = os.getenv("CONTEXTUAL_RETRIEVAL_MODEL", "gpt-4o-mini")
+
+# 문서 성격이 다르므로 청킹 전략도 분리한다.
 AX_CHUNK_SIZE = 900
 AX_CHUNK_OVERLAP = 120
 CURRICULUM_CHUNK_SIZE = 700
@@ -83,7 +93,7 @@ def _infer_curriculum_content_type(text: str) -> str:
 
 
 def _format_excel_content(text: str) -> str:
-    # 엑셀은 행/열 구조가 중요하므로, 셀 경계를 최대한 읽기 쉽게 남긴다.
+    # Excel은 행/열 구조가 중요하므로 셀 경계를 읽기 쉽게 남긴다.
     rows: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip()
@@ -117,9 +127,23 @@ def _tag_ax_type(metadata: dict[str, Any], text: str) -> None:
             return
 
 
+def _create_source_doc_id(metadata: dict[str, Any]) -> str:
+    base = "|".join(
+        [
+            str(metadata.get("source_file", "")),
+            str(metadata.get("page_number", metadata.get("sheet_name", ""))),
+            str(metadata.get("section_title", "")),
+            str(metadata.get("doc_type", "")),
+        ]
+    )
+    return _short_hash(base)
+
+
 def _build_structured_document(content: str, metadata: dict[str, Any]) -> Document:
-    # 청킹 전에 핵심 메타데이터를 본문 앞에 붙여 두면,
-    # 잘린 청크도 "무슨 문서의 어떤 부분인지" 문맥을 더 잘 유지한다.
+    # 청킹 전에 메타데이터를 본문 앞에 붙여 두면 잘린 청크도 문맥을 더 잘 유지한다.
+    metadata = dict(metadata)
+    metadata["source_doc_id"] = _create_source_doc_id(metadata)
+
     header_fields = [
         "doc_type",
         "source_name",
@@ -144,7 +168,8 @@ def _build_structured_document(content: str, metadata: dict[str, Any]) -> Docume
 
 
 def _annotate_chunks(chunks: list[Document]) -> list[Document]:
-    # chunk_id / content_hash를 넣어 두면 나중에 증분 인덱싱을 붙이기 쉽다.
+    # base_content_hash는 원본 청크 기준으로 계산한다.
+    # 이렇게 해 두면 contextual summary가 달라져도 증분 인덱싱 기준은 안정적으로 유지된다.
     source_counters: dict[tuple[str, str, str], int] = {}
     for chunk in chunks:
         source_key = (
@@ -155,14 +180,16 @@ def _annotate_chunks(chunks: list[Document]) -> list[Document]:
         chunk_index = source_counters.get(source_key, 0)
         source_counters[source_key] = chunk_index + 1
 
-        content_hash = _short_hash(chunk.page_content)
+        base_content_hash = _short_hash(chunk.page_content)
         chunk.metadata.update(
             {
                 "chunk_index": chunk_index,
-                "chunk_id": f"{chunk.metadata.get('source_name', 'doc')}:{chunk_index}:{content_hash}",
-                "content_hash": content_hash,
+                "chunk_id": f"{chunk.metadata.get('source_name', 'doc')}:{chunk_index}:{base_content_hash}",
+                "base_content_hash": base_content_hash,
+                "content_hash": base_content_hash,
                 "word_count": len(chunk.page_content.split()),
                 "indexed_at": datetime.now(timezone.utc).isoformat(),
+                "contextualized": False,
             }
         )
     return chunks
@@ -287,26 +314,96 @@ def load_curriculum_excel_documents() -> list[Document]:
     return documents
 
 
-def load_ax_compass_chunks() -> list[Document]:
+def _truncate_for_prompt(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "\n..."
+
+
+def _build_contextual_prompt(full_document: str, chunk_text: str, metadata: dict[str, Any]) -> str:
+    # 질문을 직접 찾을 수 있도록 "문서 전체 대비 이 청크의 역할"만 짧게 생성한다.
+    return f"""
+You are preparing context for retrieval.
+Write a concise Korean note, 2-3 sentences max.
+Explain where this chunk fits in the full document and what information it is useful for.
+Do not repeat the chunk verbatim.
+
+[document type]
+{metadata.get("doc_type", "")}
+
+[section]
+{metadata.get("section_title", "")}
+
+[full document excerpt]
+{_truncate_for_prompt(full_document, 2500)}
+
+[chunk]
+{_truncate_for_prompt(chunk_text, 1200)}
+""".strip()
+
+
+def _apply_contextual_retrieval(chunks: list[Document], source_lookup: dict[str, str]) -> list[Document]:
+    if not USE_CONTEXTUAL_RETRIEVAL or not chunks:
+        return chunks
+
+    print(f"[RAG] Applying contextual retrieval to {len(chunks)} chunks...")
+    llm = ChatOpenAI(
+        model=CONTEXTUAL_MODEL,
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+
+    prompts = [
+        _build_contextual_prompt(
+            source_lookup.get(chunk.metadata.get("source_doc_id", ""), chunk.page_content),
+            chunk.page_content,
+            chunk.metadata,
+        )
+        for chunk in chunks
+    ]
+
+    responses = llm.batch(prompts)
+    for chunk, response in zip(chunks, responses):
+        context_note = response.content.strip()
+        if not context_note:
+            continue
+
+        original_text = chunk.page_content
+        chunk.page_content = f"[context]\n{context_note}\n\n{original_text}"
+        chunk.metadata.update(
+            {
+                "contextualized": True,
+                "context_summary": context_note,
+                "content_hash": _short_hash(chunk.page_content),
+            }
+        )
+
+    print("[RAG] Contextual retrieval enrichment complete")
+    return chunks
+
+
+def _build_ax_compass_chunks() -> tuple[list[Document], dict[str, str]]:
     docs = load_ax_compass_documents()
+    source_lookup = {doc.metadata["source_doc_id"]: doc.page_content for doc in docs}
     chunks = _split_documents_with_strategy(
         docs,
         chunk_size=AX_CHUNK_SIZE,
         chunk_overlap=AX_CHUNK_OVERLAP,
     )
-    print(f"[RAG] AX Compass chunk count: {len(chunks)}")
-    return chunks
+    print(f"[RAG] AX Compass raw chunk count: {len(chunks)}")
+    return chunks, source_lookup
 
 
-def load_curriculum_chunks() -> list[Document]:
+def _build_curriculum_chunks() -> tuple[list[Document], dict[str, str]]:
     docs = load_curriculum_pdf_documents() + load_curriculum_excel_documents()
+    source_lookup = {doc.metadata["source_doc_id"]: doc.page_content for doc in docs}
     chunks = _split_documents_with_strategy(
         docs,
         chunk_size=CURRICULUM_CHUNK_SIZE,
         chunk_overlap=CURRICULUM_CHUNK_OVERLAP,
     )
-    print(f"[RAG] Curriculum example chunk count: {len(chunks)}")
-    return chunks
+    print(f"[RAG] Curriculum example raw chunk count: {len(chunks)}")
+    return chunks, source_lookup
 
 
 def _collection_count(vectorstore: Chroma) -> int:
@@ -314,30 +411,39 @@ def _collection_count(vectorstore: Chroma) -> int:
 
 
 def _get_indexed_hashes(vectorstore: Chroma) -> set[str]:
-    # 이미 저장된 content_hash를 읽어 와서 같은 청크를 다시 넣지 않는다.
+    # 증분 인덱싱은 base_content_hash를 기준으로 본다.
+    # contextual summary가 조금 달라도 원본 청크가 같으면 중복 추가하지 않는다.
     try:
         result = vectorstore._collection.get(include=["metadatas"])
     except Exception:
         return set()
 
-    return {
-        metadata.get("content_hash", "")
-        for metadata in result.get("metadatas", [])
-        if metadata and metadata.get("content_hash")
-    }
+    hashes: set[str] = set()
+    for metadata in result.get("metadatas", []):
+        if not metadata:
+            continue
+        stable_hash = metadata.get("base_content_hash") or metadata.get("content_hash")
+        if stable_hash:
+            hashes.add(stable_hash)
+    return hashes
 
 
 def _filter_new_documents(docs: list[Document], indexed_hashes: set[str]) -> list[Document]:
-    return [doc for doc in docs if doc.metadata.get("content_hash", "") not in indexed_hashes]
+    return [
+        doc
+        for doc in docs
+        if (doc.metadata.get("base_content_hash") or doc.metadata.get("content_hash", "")) not in indexed_hashes
+    ]
 
 
 def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
     # 첫 실행은 전체 인덱싱, 이후에는 새 청크만 추가하는 구조다.
-    # 삭제/수정 동기화는 아직 아니지만, 증분 인덱싱으로 확장하기 쉬운 형태다.
+    # 나중에 수정/삭제 동기화가 필요해져도 이 구조에서 확장하기 쉽다.
     existing_count = _collection_count(vectorstore)
-    chunks = loader()
+    raw_chunks, source_lookup = loader()
 
     if existing_count == 0:
+        chunks = _apply_contextual_retrieval(raw_chunks, source_lookup)
         print(f"[VectorDB] Indexing {label} collection...")
         if chunks:
             vectorstore.add_documents(chunks)
@@ -345,8 +451,10 @@ def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
         return
 
     indexed_hashes = _get_indexed_hashes(vectorstore)
-    new_chunks = _filter_new_documents(chunks, indexed_hashes)
+    # 먼저 "새 청크인지" 판별하고, 그 뒤에만 context를 생성해야 불필요한 LLM 재호출이 없다.
+    new_chunks = _filter_new_documents(raw_chunks, indexed_hashes)
     if new_chunks:
+        new_chunks = _apply_contextual_retrieval(new_chunks, source_lookup)
         print(f"[VectorDB] Adding {len(new_chunks)} new {label} chunks...")
         vectorstore.add_documents(new_chunks)
         print(f"[VectorDB] {label} updated ({_collection_count(vectorstore)} chunks)")
@@ -365,6 +473,6 @@ def setup_vector_store() -> Chroma:
         persist_directory=VECTOR_DB_PATH,
     )
 
-    _ensure_index(vectorstore, load_ax_compass_chunks, "AX Compass")
-    _ensure_index(vectorstore, load_curriculum_chunks, "Curriculum examples")
+    _ensure_index(vectorstore, _build_ax_compass_chunks, "AX Compass")
+    _ensure_index(vectorstore, _build_curriculum_chunks, "Curriculum examples")
     return vectorstore
