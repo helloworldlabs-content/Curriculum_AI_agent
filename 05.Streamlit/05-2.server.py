@@ -5,7 +5,7 @@ import hashlib                              # 청크 고유 ID 생성 (SHA-1 해
 import os                                   # 환경변수 읽기, 파일 경로 처리
 from datetime import datetime, timedelta, timezone  # JWT 만료 시간 계산
 from textwrap import dedent                 # 멀티라인 문자열 앞의 들여쓰기 제거
-from typing import Any, Literal             # 타입 힌트
+from typing import Any, Literal, TypedDict  # 타입 힌트
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 서드파티 라이브러리
@@ -23,6 +23,7 @@ from langchain_community.document_loaders import (
     PyPDFLoader,              # PDF 파일을 페이지 단위로 읽어오는 로더
     UnstructuredExcelLoader,  # Excel 파일을 시트 단위로 읽어오는 로더
 )
+from langchain_community.retrievers import BM25Retriever  # BM25 희소 검색 (Hybrid Search)
 from langchain_core.documents import Document                   # 텍스트 + 메타데이터 단위
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage  # LLM 메시지 타입
 from langchain_core.runnables import RunnableLambda             # 함수를 LCEL 체인에 연결
@@ -259,8 +260,15 @@ def to_lc_messages(messages: list[Message]) -> list:
 #   3. 청킹 (문서 종류별 크기 분리)
 #   4. 메타데이터 주석 (chunk_id, content_hash 등)
 #   5. 벡터 DB 저장 (AX Compass / 커리큘럼 예시 컬렉션 분리)
-#   6. 검색 → 프롬프트 구성 → LLM 생성
+#   6. 검색 → Hybrid Search (Dense + BM25) → RRF 재정렬 → 프롬프트 구성 → LLM 생성
 # ─────────────────────────────────────────────────────────────────────────────
+
+# 컬렉션 단위 타입: Chroma(벡터 검색)와 BM25(희소 검색)를 하나로 묶는다.
+# rerank 등 후처리 단계에서도 동일한 구조를 재사용한다.
+class VectorCollection(TypedDict):
+    vectorstore: Chroma
+    bm25: BM25Retriever
+
 
 # ── 전처리 헬퍼 함수들 ────────────────────────────────────────────────────────
 
@@ -492,6 +500,48 @@ def _enrich_chunks_with_context(
     return chunks
 
 
+# ── Hybrid Search 헬퍼 ────────────────────────────────────────────────────────
+
+# Chroma 스타일의 메타데이터 필터를 BM25 결과에 사후 적용한다.
+# BM25는 필터를 지원하지 않으므로, 검색 후 조건에 맞지 않는 문서를 제거한다.
+# 현재 지원 연산자: $in (예: {"type_name": {"$in": ["균형형", "이해형"]}})
+def _apply_metadata_filter(docs: list[Document], filter: dict) -> list[Document]:
+    result = []
+    for doc in docs:
+        match = True
+        for field, condition in filter.items():
+            val = doc.metadata.get(field)
+            if isinstance(condition, dict):
+                if "$in" in condition and val not in condition["$in"]:
+                    match = False
+                    break
+            elif val != condition:
+                match = False
+                break
+        if match:
+            result.append(doc)
+    return result
+
+
+# 여러 검색 결과 리스트를 Reciprocal Rank Fusion(RRF)으로 합산해 재정렬한다.
+#
+# RRF 공식: score(d) = Σ 1 / (k + rank(d))
+#   - k=60: 상위 랭크 문서의 점수 과팽창을 방지하는 상수 (Cormack et al. 2009 기본값)
+#   - 여러 검색기에서 공통으로 등장한 문서는 점수가 누적되어 상위로 올라온다.
+# chunk_id가 같으면 동일 문서로 간주해 중복을 제거한다.
+def _reciprocal_rank_fusion(
+    results_list: list[list[Document]], k: int = 60
+) -> list[Document]:
+    scores: dict[str, float] = {}
+    docs_map: dict[str, Document] = {}
+    for results in results_list:
+        for rank, doc in enumerate(results):
+            doc_id = doc.metadata.get("chunk_id", doc.page_content[:80])
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+            docs_map[doc_id] = doc
+    return [docs_map[doc_id] for doc_id, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)]
+
+
 # ── 문서 로드 함수들 ──────────────────────────────────────────────────────────
 
 # PDF 파일 1개를 페이지별로 읽어 Document 리스트로 반환하는 공통 헬퍼.
@@ -645,6 +695,18 @@ def _create_vector_store(embeddings: OpenAIEmbeddings, collection_name: str) -> 
     )
 
 
+# Chroma 컬렉션에 저장된 모든 문서를 가져와 BM25 인덱스를 구성한다.
+# 서버 재시작 시 Chroma에서 문서를 읽어 매번 재구성한다 (in-memory).
+def _build_bm25_index(vectorstore: Chroma) -> BM25Retriever:
+    result = vectorstore.get()
+    docs = [
+        Document(page_content=text, metadata=meta)
+        for text, meta in zip(result["documents"], result["metadatas"])
+        if text
+    ]
+    return BM25Retriever.from_documents(docs)
+
+
 # 컬렉션이 비어 있을 때만 문서를 로드하고 인덱싱한다.
 # 이미 데이터가 있으면 재인덱싱 없이 기존 컬렉션을 사용한다.
 def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
@@ -665,7 +727,7 @@ def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
 # 컬렉션을 분리하는 이유:
 # - AX Compass: 유형 정보 전용, 검색 시 type_name 필터 활용
 # - 커리큘럼 예시: 세션 구성 참고용, 필터 없이 의미 검색
-def setup_vector_stores(llm: ChatOpenAI) -> dict[str, Chroma]:
+def setup_vector_stores(llm: ChatOpenAI) -> dict[str, VectorCollection]:
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         api_key=os.getenv("OPENAI_API_KEY"),
@@ -676,35 +738,57 @@ def setup_vector_stores(llm: ChatOpenAI) -> dict[str, Chroma]:
     _ensure_index(ax_store,         lambda: load_ax_compass_chunks(llm),  "AX Compass")
     _ensure_index(curriculum_store, lambda: load_curriculum_chunks(llm),  "커리큘럼 예시")
 
+    print("[VectorDB] BM25 인덱스 구성 중...")
+    ax_bm25         = _build_bm25_index(ax_store)
+    curriculum_bm25 = _build_bm25_index(curriculum_store)
+    print("[VectorDB] BM25 인덱스 완료")
+
     return {
-        "ax_compass":         ax_store,
-        "curriculum_examples": curriculum_store,
+        "ax_compass":          VectorCollection(vectorstore=ax_store,         bm25=ax_bm25),
+        "curriculum_examples": VectorCollection(vectorstore=curriculum_store, bm25=curriculum_bm25),
     }
 
 
 # ── 검색 함수 ─────────────────────────────────────────────────────────────────
 
-# 벡터 DB에서 유사도 검색을 수행하는 공통 헬퍼.
-# filter를 넘기면 해당 조건에 맞는 청크만 검색한다.
-def _retrieve(vectorstore: Chroma, query: str, k: int, filter: dict | None = None) -> list[Document]:
+# Dense(Chroma) + Sparse(BM25) 검색 결과를 RRF로 합산하는 Hybrid Search 헬퍼.
+# bm25가 None이면 Dense 단독 검색으로 동작한다.
+# filter는 Chroma에 직접 적용하고, BM25 결과에는 사후 적용(_apply_metadata_filter)한다.
+def _retrieve(
+    vectorstore: Chroma,
+    query: str,
+    k: int,
+    filter: dict | None = None,
+    bm25: BM25Retriever | None = None,
+) -> list[Document]:
     search_kwargs: dict[str, Any] = {"k": k}
     if filter:
         search_kwargs["filter"] = filter
-    return vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs).invoke(query)
+    dense_docs = vectorstore.as_retriever(search_type="similarity", search_kwargs=search_kwargs).invoke(query)
+
+    if bm25 is None:
+        return dense_docs
+
+    bm25.k = k
+    sparse_docs = bm25.invoke(query)
+    if filter:
+        sparse_docs = _apply_metadata_filter(sparse_docs, filter)
+
+    return _reciprocal_rank_fusion([dense_docs, sparse_docs])[:k]
 
 
-# 특정 AX Compass 유형들의 특성 정보를 벡터 DB에서 검색해 반환한다.
+# 특정 AX Compass 유형들의 특성 정보를 Hybrid Search로 검색해 반환한다.
 # k = max(4, len(type_names) * 3): 유형 수에 비례해 넉넉하게 검색
-# filter: 해당 유형 청크만 검색 (다른 유형 내용이 섞이지 않도록)
-def retrieve_group_context(vectorstore: Chroma, type_names: list[str]) -> str:
+# filter: 해당 유형 청크만 검색 (Dense는 직접 적용, BM25는 사후 필터링)
+def retrieve_group_context(vectorstore: Chroma, type_names: list[str], bm25: BM25Retriever | None = None) -> str:
     query = f"{', '.join(type_names)} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법"
-    docs  = _retrieve(vectorstore, query, max(4, len(type_names) * 3), {"type_name": {"$in": type_names}})
+    docs  = _retrieve(vectorstore, query, max(4, len(type_names) * 3), {"type_name": {"$in": type_names}}, bm25)
     return "\n\n".join(d.page_content for d in docs)
 
 
-# 주제와 수준에 맞는 커리큘럼 예시를 벡터 DB에서 검색해 반환한다.
-def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) -> str:
-    docs = _retrieve(vectorstore, query, k)
+# 주제와 수준에 맞는 커리큘럼 예시를 Hybrid Search로 검색해 반환한다.
+def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3, bm25: BM25Retriever | None = None) -> str:
+    docs = _retrieve(vectorstore, query, k, bm25=bm25)
     return "\n\n---\n\n".join(d.page_content for d in docs)
 
 
@@ -721,7 +805,7 @@ def retrieve_curriculum_examples(vectorstore: Chroma, query: str, k: int = 3) ->
 #         ↓
 #     structured_llm (ChatOpenAI → CurriculumPlan)
 #         - LLM이 CurriculumPlan 구조로 직접 출력
-def build_chain(vectorstores: dict[str, Chroma]):
+def build_chain(vectorstores: dict[str, VectorCollection]):
     llm            = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)  # Pydantic 모델로 직접 파싱
 
@@ -736,19 +820,19 @@ def build_chain(vectorstores: dict[str, Chroma]):
         theory_hours = round(total_hours * 0.65)
         group_hours  = total_hours - theory_hours
 
-        ax_vectorstore         = vectorstores["ax_compass"]
-        curriculum_vectorstore = vectorstores["curriculum_examples"]
+        ax_col         = vectorstores["ax_compass"]
+        curriculum_col = vectorstores["curriculum_examples"]
 
         ga, gb, gc = groups["group_a"], groups["group_b"], groups["group_c"]
 
-        # 그룹별 유형 특성 검색
-        ctx_a = retrieve_group_context(ax_vectorstore, ga["types"])
-        ctx_b = retrieve_group_context(ax_vectorstore, gb["types"])
-        ctx_c = retrieve_group_context(ax_vectorstore, gc["types"])
+        # 그룹별 유형 특성 검색 (Hybrid: Dense + BM25)
+        ctx_a = retrieve_group_context(ax_col["vectorstore"], ga["types"], ax_col["bm25"])
+        ctx_b = retrieve_group_context(ax_col["vectorstore"], gb["types"], ax_col["bm25"])
+        ctx_c = retrieve_group_context(ax_col["vectorstore"], gc["types"], ax_col["bm25"])
 
-        # 주제 + 수준 기반 커리큘럼 예시 검색
+        # 주제 + 수준 기반 커리큘럼 예시 검색 (Hybrid: Dense + BM25)
         curriculum_query    = f"{info.topic} {info.level} 기업 AI 교육 커리큘럼"
-        curriculum_examples = retrieve_curriculum_examples(curriculum_vectorstore, curriculum_query)
+        curriculum_examples = retrieve_curriculum_examples(curriculum_col["vectorstore"], curriculum_query, bm25=curriculum_col["bm25"])
 
         # SystemMessage는 이미 GENERATION_SYSTEM_PROMPT로 대체되므로 대화 기록에서 제외
         chat_history = [m for m in conversation if not isinstance(m, SystemMessage)]
@@ -820,7 +904,7 @@ def login(req: LoginRequest):
 # 서버 상태와 벡터 DB 청크 수를 반환한다.
 @app.get("/health")
 def health(_: str = Depends(verify_token)):
-    collections = {name: _collection_count(store) for name, store in _vectorstores.items()}
+    collections = {name: _collection_count(col["vectorstore"]) for name, col in _vectorstores.items()}
     return {"status": "ok", "chunks": sum(collections.values()), "collections": collections}
 
 
