@@ -1,13 +1,11 @@
 import json
 import logging
-import json
 import os
 import re
 from time import perf_counter
 from textwrap import dedent
 
 from langchain_chroma import Chroma
-from langchain_core.documents import Document
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableLambda
@@ -72,6 +70,102 @@ def to_lc_messages(messages: list[Message]) -> list:
     return [_MSG_CLS[message.role](content=message.content) for message in messages]
 
 
+def _tokenize_for_bm25(text: str) -> list[str]:
+    # 한국어/영문 키워드를 단순 토큰으로 잘라 BM25에 사용한다.
+    return [token.lower() for token in re.findall(r"[0-9A-Za-z가-힣+#/.]{2,}", text or "")]
+
+
+def _display_text(doc: Document) -> str:
+    # 최종적으로 사용자나 LLM에 보여 줄 텍스트를 꺼낸다.
+    return str(doc.metadata.get("display_text") or doc.page_content)
+
+
+def _bm25_text(doc: Document) -> str:
+    # BM25 키워드 검색에만 쓸 전용 텍스트를 꺼낸다.
+    return str(doc.metadata.get("bm25_text") or doc.page_content)
+
+
+def _as_display_doc(doc: Document) -> Document:
+    # 검색 결과는 마지막에 display_text 기준으로 쓰기 쉽게 맞춰 둔다.
+    return Document(page_content=_display_text(doc), metadata=doc.metadata)
+
+
+def _doc_identity(doc: Document) -> str:
+    # dense/sparse 검색이 같은 문서를 찾았을 때 하나로 합치기 위한 ID다.
+    metadata = doc.metadata or {}
+    return str(
+        metadata.get("chunk_id")
+        or metadata.get("content_hash")
+        or metadata.get("base_content_hash")
+        or _tokenize_for_bm25(doc.page_content[:200])
+    )
+
+
+def _search_filter_key(search_filter: dict) -> str:
+    # dict는 바로 캐시 키로 쓰기 어려워서 문자열로 바꾼다.
+    return json.dumps(search_filter, sort_keys=True, ensure_ascii=False)
+
+
+def _load_filtered_docs(
+    vectorstore: Chroma,
+    search_filter: dict,
+    cache: dict[str, list[Document]],
+) -> list[Document]:
+    # BM25는 필터에 맞는 문서 후보를 먼저 모은 뒤 그 안에서 점수를 계산한다.
+    cache_key = _search_filter_key(search_filter)
+    if cache_key in cache:
+        return cache[cache_key]
+
+    result = vectorstore._collection.get(
+        where=search_filter,
+        include=["documents", "metadatas"],
+    )
+    docs = [
+        Document(
+            page_content=str((metadata or {}).get("display_text") or document),
+            metadata=metadata or {},
+        )
+        for document, metadata in zip(result.get("documents", []), result.get("metadatas", []))
+    ]
+    cache[cache_key] = docs
+    return docs
+
+
+def _bm25_search(candidate_docs: list[Document], query: str, *, k: int) -> list[Document]:
+    # 필터에 맞는 후보들 안에서 BM25 점수로 상위 문서를 고른다.
+    if not candidate_docs:
+        return []
+
+    tokenized_query = _tokenize_for_bm25(query)
+    if not tokenized_query:
+        return candidate_docs[:k]
+
+    tokenized_corpus = [_tokenize_for_bm25(_bm25_text(doc)) for doc in candidate_docs]
+    bm25 = BM25Okapi(tokenized_corpus)
+    scores = bm25.get_scores(tokenized_query)
+    ranked_pairs = sorted(zip(candidate_docs, scores), key=lambda item: item[1], reverse=True)
+    return [doc for doc, score in ranked_pairs[:k] if score > 0]
+
+
+def _hybrid_fuse(dense_docs: list[Document], sparse_docs: list[Document], *, k: int) -> list[Document]:
+    # 벡터 검색과 BM25 검색 결과를 섞어 최종 순위를 만든다.
+    fused_scores: dict[str, float] = {}
+    doc_lookup: dict[str, Document] = {}
+
+    for rank, doc in enumerate(dense_docs, start=1):
+        doc_id = _doc_identity(doc)
+        doc_lookup[doc_id] = _as_display_doc(doc)
+        fused_scores[doc_id] = fused_scores.get(doc_id, 0.0) + HYBRID_VECTOR_WEIGHT * (1 / rank)
+
+    for rank, doc in enumerate(sparse_docs, start=1):
+        doc_id = _doc_identity(doc)
+        doc_lookup[doc_id] = _as_display_doc(doc)
+        fused_scores[doc_id] = fused_scores.get(doc_id, 0.0) + HYBRID_BM25_WEIGHT * (1 / rank)
+
+    ranked_ids = sorted(fused_scores, key=fused_scores.get, reverse=True)
+    return [doc_lookup[doc_id] for doc_id in ranked_ids[:k]]
+
+
 def _retrieve(
     vectorstore: Chroma,
     query: str,
@@ -81,7 +175,7 @@ def _retrieve(
     label: str,
     corpus_cache: dict[str, list[Document]],
 ):
-    # 실제 하이브리드 검색 진입점이다.
+    # 실제 Hybrid Search 진입점이다.
     # 1) 벡터 검색 2) BM25 검색 3) 둘을 합치기 순서로 동작한다.
     logger.info("[GENERATE][%s] retrieval start k=%s query=%s", label, k, query[:160])
     started_at = perf_counter()
@@ -102,11 +196,8 @@ def _retrieve(
 
     logger.info(
         "[GENERATE][%s] retrieval done docs=%s dense=%s sparse=%s chars=%s elapsed=%.2fs",
-        "[GENERATE][%s] retrieval done docs=%s dense=%s sparse=%s chars=%s elapsed=%.2fs",
         label,
         len(docs),
-        len(dense_docs),
-        len(sparse_docs),
         len(dense_docs),
         len(sparse_docs),
         sum(len(doc.page_content) for doc in docs),
@@ -135,7 +226,6 @@ def retrieve_group_context(
             ]
         },
         label=f"{group_label}_ax",
-        corpus_cache=corpus_cache,
         corpus_cache=corpus_cache,
     )
     return "\n\n".join(doc.page_content for doc in docs)
@@ -199,7 +289,7 @@ def retrieve_curriculum_examples(
     k: int = 2,
     corpus_cache: dict[str, list[Document]],
 ) -> str:
-    # 커리큘럼 예시는 하이브리드 검색 후 한 번 더 재정렬해서 정말 참고할 문서만 남긴다.
+    # 커리큘럼 예시는 Hybrid Search 후 한 번 더 재정렬해서 정말 참고할 문서만 남긴다.
     query = _build_curriculum_query(info)
     candidates = _retrieve(
         vectorstore,
@@ -208,18 +298,22 @@ def retrieve_curriculum_examples(
         search_filter={"doc_type": {"$eq": "curriculum_example"}},
         label="curriculum_examples",
         corpus_cache=corpus_cache,
-        corpus_cache=corpus_cache,
     )
+    scored_docs = [
+        (doc, _score_curriculum_doc(doc, info))
+        for doc in candidates
+    ]
     ranked_docs = sorted(
-        candidates,
-        key=lambda doc: (_score_curriculum_doc(doc, info), len(doc.page_content)),
+        scored_docs,
+        key=lambda item: (item[1], len(item[0].page_content)),
         reverse=True,
     )
-    selected_docs = ranked_docs[:k]
+    selected_docs = [doc for doc, _score in ranked_docs[:k]]
+    selected_scores = [score for _doc, score in ranked_docs[:k]]
     logger.info(
         "[GENERATE][curriculum_examples] rerank selected=%s candidate_scores=%s",
         len(selected_docs),
-        [_score_curriculum_doc(doc, info) for doc in selected_docs],
+        selected_scores,
     )
     return "\n\n---\n\n".join(doc.page_content for doc in selected_docs)
 
@@ -228,7 +322,6 @@ def build_chain(vectorstore: Chroma):
     # 검색 결과를 모아 최종 커리큘럼 생성 LLM으로 넘기는 체인을 만든다.
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
     structured_llm = llm.with_structured_output(CurriculumPlan)
-    corpus_cache: dict[str, list[Document]] = {}
     corpus_cache: dict[str, list[Document]] = {}
 
     def retrieve_and_build_messages(input_dict: dict) -> list:
@@ -255,7 +348,6 @@ def build_chain(vectorstore: Chroma):
         ctx_b = retrieve_group_context(vectorstore, gb["types"], group_label="group_b", corpus_cache=corpus_cache)
         ctx_c = retrieve_group_context(vectorstore, gc["types"], group_label="group_c", corpus_cache=corpus_cache)
 
-        curriculum_examples = retrieve_curriculum_examples(vectorstore, info, corpus_cache=corpus_cache)
         curriculum_examples = retrieve_curriculum_examples(vectorstore, info, corpus_cache=corpus_cache)
 
         chat_history = [message for message in conversation if not isinstance(message, SystemMessage)]
