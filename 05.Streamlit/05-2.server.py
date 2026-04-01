@@ -433,6 +433,65 @@ def _split_documents_with_strategy(
     return _annotate_chunks(chunks)
 
 
+# ── Contextual Retrieval ───────────────────────────────────────────────────────
+
+# 청크 1개에 대해 부모 문서 전체를 참조해 맥락 설명을 생성한다.
+# 생성된 설명은 청크 앞에 [context] 태그로 prepend되어 임베딩 품질을 높인다.
+# 실패 시 빈 문자열을 반환해 청크 자체는 보존한다.
+def _generate_chunk_context(llm: ChatOpenAI, doc_content: str, chunk_content: str) -> str:
+    prompt = (
+        "아래는 문서 전체 내용이다.\n\n"
+        f"<document>\n{doc_content}\n</document>\n\n"
+        "아래는 이 문서에서 추출한 청크다.\n\n"
+        f"<chunk>\n{chunk_content}\n</chunk>\n\n"
+        "검색 정확도 향상을 위해, 이 청크가 문서 전체에서 어떤 맥락에 위치하는지를 "
+        "1~2문장으로 간결하게 설명해라. 설명 외 다른 내용은 출력하지 마라."
+    )
+    try:
+        return llm.invoke([HumanMessage(content=prompt)]).content.strip()
+    except Exception:
+        return ""
+
+
+# 청킹된 Document 리스트 전체에 Contextual Retrieval을 적용한다.
+#
+# 동작 방식:
+#   1. source_docs(청킹 전 원본)에서 (source_file, page/sheet) → 본문 조회 테이블 구성
+#   2. 각 청크의 메타데이터로 부모 문서를 찾아 LLM 컨텍스트 생성
+#   3. 청크 본문 앞에 "[context] <생성된 설명>" 을 prepend
+#   4. 메타데이터에 has_context=True 플래그 추가 (나중에 hybrid search / rerank 에서 활용)
+def _enrich_chunks_with_context(
+    llm: ChatOpenAI,
+    chunks: list[Document],
+    source_docs: list[Document],
+) -> list[Document]:
+    # 부모 문서 조회 테이블: (source_file, page_number 또는 sheet_name) → 전체 문서 텍스트
+    doc_lookup: dict[tuple, str] = {}
+    for doc in source_docs:
+        key = (
+            doc.metadata.get("source_file", ""),
+            doc.metadata.get("page_number") or doc.metadata.get("sheet_name", ""),
+        )
+        doc_lookup[key] = doc.page_content
+
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        key = (
+            chunk.metadata.get("source_file", ""),
+            chunk.metadata.get("page_number") or chunk.metadata.get("sheet_name", ""),
+        )
+        parent_content = doc_lookup.get(key, "")
+        if parent_content:
+            context = _generate_chunk_context(llm, parent_content, chunk.page_content)
+            if context:
+                chunk.page_content = f"[context] {context}\n\n{chunk.page_content}"
+                chunk.metadata["has_context"] = True
+        print(f"[Contextual] {i}/{total} 청크 컨텍스트 생성 완료", end="\r")
+
+    print()  # 진행 표시줄 개행
+    return chunks
+
+
 # ── 문서 로드 함수들 ──────────────────────────────────────────────────────────
 
 # PDF 파일 1개를 페이지별로 읽어 Document 리스트로 반환하는 공통 헬퍼.
@@ -544,26 +603,28 @@ def load_curriculum_excel_documents() -> list[Document]:
     return documents
 
 
-# AX Compass 문서를 로드하고 청킹까지 완료한 청크 리스트를 반환한다.
-def load_ax_compass_chunks() -> list[Document]:
+# AX Compass 문서를 로드하고 청킹 + Contextual Retrieval 컨텍스트 생성까지 완료한 청크 리스트를 반환한다.
+def load_ax_compass_chunks(llm: ChatOpenAI) -> list[Document]:
     docs   = load_ax_compass_documents()
     chunks = _split_documents_with_strategy(
         docs,
         chunk_size=AX_CHUNK_SIZE,
         chunk_overlap=AX_CHUNK_OVERLAP,
     )
+    chunks = _enrich_chunks_with_context(llm, chunks, docs)
     print(f"[RAG] AX Compass 청크 수: {len(chunks)}")
     return chunks
 
 
-# 커리큘럼 예시(PDF + Excel)를 로드하고 청킹까지 완료한 청크 리스트를 반환한다.
-def load_curriculum_chunks() -> list[Document]:
+# 커리큘럼 예시(PDF + Excel)를 로드하고 청킹 + Contextual Retrieval 컨텍스트 생성까지 완료한 청크 리스트를 반환한다.
+def load_curriculum_chunks(llm: ChatOpenAI) -> list[Document]:
     docs   = load_curriculum_pdf_documents() + load_curriculum_excel_documents()
     chunks = _split_documents_with_strategy(
         docs,
         chunk_size=CURRICULUM_CHUNK_SIZE,
         chunk_overlap=CURRICULUM_CHUNK_OVERLAP,
     )
+    chunks = _enrich_chunks_with_context(llm, chunks, docs)
     print(f"[RAG] 커리큘럼 예시 청크 수: {len(chunks)}")
     return chunks
 
@@ -604,7 +665,7 @@ def _ensure_index(vectorstore: Chroma, loader, label: str) -> None:
 # 컬렉션을 분리하는 이유:
 # - AX Compass: 유형 정보 전용, 검색 시 type_name 필터 활용
 # - 커리큘럼 예시: 세션 구성 참고용, 필터 없이 의미 검색
-def setup_vector_stores() -> dict[str, Chroma]:
+def setup_vector_stores(llm: ChatOpenAI) -> dict[str, Chroma]:
     embeddings = OpenAIEmbeddings(
         model="text-embedding-3-small",
         api_key=os.getenv("OPENAI_API_KEY"),
@@ -612,8 +673,8 @@ def setup_vector_stores() -> dict[str, Chroma]:
     ax_store         = _create_vector_store(embeddings, AX_COLLECTION_NAME)
     curriculum_store = _create_vector_store(embeddings, CURRICULUM_COLLECTION_NAME)
 
-    _ensure_index(ax_store,         load_ax_compass_chunks,  "AX Compass")
-    _ensure_index(curriculum_store, load_curriculum_chunks,  "커리큘럼 예시")
+    _ensure_index(ax_store,         lambda: load_ax_compass_chunks(llm),  "AX Compass")
+    _ensure_index(curriculum_store, lambda: load_curriculum_chunks(llm),  "커리큘럼 예시")
 
     return {
         "ax_compass":         ax_store,
@@ -736,7 +797,7 @@ def build_chain(vectorstores: dict[str, Chroma]):
 # ─────────────────────────────────────────────────────────────────────────────
 
 _llm          = ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=os.getenv("OPENAI_API_KEY"))
-_vectorstores = setup_vector_stores()   # AX Compass + 커리큘럼 예시 컬렉션 로드/인덱싱
+_vectorstores = setup_vector_stores(_llm)  # AX Compass + 커리큘럼 예시 컬렉션 로드/인덱싱 (Contextual Retrieval 포함)
 _chain        = build_chain(_vectorstores)  # RAG 체인 준비
 
 app = FastAPI(title="AI 커리큘럼 백엔드")
