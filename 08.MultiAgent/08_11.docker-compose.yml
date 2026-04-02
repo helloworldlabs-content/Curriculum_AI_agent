@@ -1,0 +1,16 @@
+# 실행: docker-compose -f 08.MultiAgent/08_11.docker-compose.yml up --build -d backend
+# 중지: docker-compose -f 08.MultiAgent/08_11.docker-compose.yml down
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: 08.MultiAgent/08_10.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../Data:/app/Data
+      - ../vectorDB:/app/vectorDB
+    env_file:
+      - ../.env
+    restart: unless-stopped
