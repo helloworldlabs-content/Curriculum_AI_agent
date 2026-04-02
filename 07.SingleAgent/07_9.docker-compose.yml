@@ -1,0 +1,32 @@
+# 실행: docker-compose -f 07.SingleAgent/07_9.docker-compose.yml up --build
+# 중지: docker-compose -f 07.SingleAgent/07_9.docker-compose.yml down
+
+services:
+  backend:
+    build:
+      context: ..
+      dockerfile: 07.SingleAgent/07_8.Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ../Data:/app/Data
+      - ../vectorDB:/app/vectorDB
+    env_file:
+      - ../.env
+    restart: unless-stopped
+
+  frontend:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >
+      bash -c "pip install --no-cache-dir streamlit requests python-dotenv &&
+               streamlit run 07_7.Streamlit.py --server.port 8501 --server.address 0.0.0.0"
+    volumes:
+      - ./07_7.Streamlit.py:/app/07_7.Streamlit.py
+    ports:
+      - "8501:8501"
+    env_file:
+      - ../.env
+    depends_on:
+      - backend
+    restart: unless-stopped
