@@ -47,7 +47,9 @@ SYSTEM_PROMPT = dedent(
     ## 출력 규칙
     - passed: 4가지 기준을 모두 통과해야 true
     - feedback: 통과하지 못한 기준만 구체적으로 작성. 커리큘럼 에이전트가 재생성 시 반영할 수 있도록
-      "X일차 common_sessions 합계가 N시간인데 hours_per_day는 M시간입니다. 조정 필요." 처럼 구체적으로 서술한다.
+      반드시 "X일차 common_sessions 합계 Ah + 그룹 sessions 합계 Bh = (A+B)h 인데 hours_per_day는 Ch입니다. 조정 필요."
+      형식으로 common과 group을 모두 합산한 값과 hours_per_day를 비교해 서술한다.
+      common만 단독으로 hours_per_day와 비교하는 것은 오류다.
     - summary: 사용자에게 보여줄 평가 결과 요약 (통과 시 "평가를 통과했습니다.", 미통과 시 주요 문제 1~2개 언급)
     """
 ).strip()
