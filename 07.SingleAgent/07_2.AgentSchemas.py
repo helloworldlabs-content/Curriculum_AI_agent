@@ -1,25 +1,86 @@
-from __future__ import annotations
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 
-class AgentInput(BaseModel):
-    # messages는 대화형 입력을 그대로 넣을 때 사용한다.
-    messages: list[dict] = Field(default_factory=list, description="대화 메시지 목록")
-    # collected_info가 있으면 정보 수집 단계를 건너뛸 수 있다.
-    collected_info: dict | None = Field(default=None, description="이미 구조화된 요구사항")
-    # 평가에서 꼭 반영되길 기대하는 항목들이다.
-    must_cover: list[str] = Field(default_factory=list, description="반드시 반영되길 기대하는 항목")
-    # 평가를 같이 돌릴지 여부다.
-    run_evaluation: bool = Field(default=True, description="평가까지 함께 실행할지 여부")
-    # 결과 md 파일을 저장할 위치다. 비우면 자동으로 파일명이 만들어진다.
-    output_path: str | None = Field(default=None, description="출력 markdown 경로")
-    case_id: str = Field(default="single_agent_case", description="케이스 식별자")
+# 채팅 메시지 단위
+class Message(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
 
 
-class AgentOutput(BaseModel):
-    case_id: str
-    collected_info: dict
-    curriculum_plan: dict
-    evaluation: dict | None = None
-    markdown_path: str
+# /chat 요청/응답
+class ChatRequest(BaseModel):
+    messages: list[Message]
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    complete: bool
+    curriculum: dict | None = None
+
+
+# 커리큘럼 구성 단위
+class Session(BaseModel):
+    title: str
+    duration_hours: float
+    goals: list[str]
+    activities: list[str]
+
+
+class GroupInfo(BaseModel):
+    group_name: str
+    target_types: str
+    participant_count: int
+    focus_description: str
+
+
+class GroupDaySessions(BaseModel):
+    group_name: str
+    sessions: list[Session]
+
+
+class DaySchedule(BaseModel):
+    day: int
+    theme: str
+    common_sessions: list[Session]
+    group_sessions: list[GroupDaySessions]
+
+
+# LLM이 최종 출력하는 커리큘럼 전체 구조
+class CurriculumPlan(BaseModel):
+    program_title: str
+    target_summary: str
+    groups: list[GroupInfo]
+    daily_schedules: list[DaySchedule]
+    expected_outcomes: list[str]
+    notes: list[str]
+
+
+# 에이전트가 create_curriculum 도구 호출 시 받는 수집 정보
+class CollectedInfo(BaseModel):
+    company_name:        str = Field(description="회사명 또는 팀 이름")
+    goal:                str = Field(description="교육 목표")
+    audience:            str = Field(description="교육 대상자")
+    level:               str = Field(description="현재 AI 활용 수준")
+    days:                int = Field(description="총 교육 기간 (일수)")
+    hours_per_day:       int = Field(description="하루 교육 시간 (시간)")
+    topic:               str = Field(description="원하는 핵심 주제")
+    constraints:         str = Field(description="반영해야 할 조건 또는 제한사항")
+    count_balanced:      int = Field(description="균형형 인원수")
+    count_learner:       int = Field(description="이해형 인원수")
+    count_overconfident: int = Field(description="과신형 인원수")
+    count_doer:          int = Field(description="실행형 인원수")
+    count_analyst:       int = Field(description="판단형 인원수")
+    count_cautious:      int = Field(description="조심형 인원수")
+
+
+# 인증 요청/응답
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
