@@ -15,10 +15,10 @@
 | Chapter.3 | `04.RAG` | LangChain을 활용하여 챗봇에 RAG 적용하기 | [04.RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/04.RAG) |
 | Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 및 Docker 배포 실습 | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
 | Chapter.5 | `05.Advanced_RAG` | 인덱싱 파이프라인 고도화 및 Contextual Retrieval | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
-| Chapter.6 | `05.Advanced_RAG` | Hybrid Search 및 Reranking | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
-| Chapter.7 | `06.Evaluation` | RAG 성능 평가 | [06.Evaluation](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/06.Evaluation) |
-| Chapter.8 | `07.SingleAgent` | LangGraph를 활용한 AI Agent 만들기 | [07.SingleAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/07.SingleAgent) |
-| Chapter.9 | `08.MultiAgent` | 오케스트레이터를 활용한 Multi Agent 만들기 | [08.MultiAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/08.MultiAgent) |
+| Chapter.5 | `05.Advanced_RAG` | Hybrid Search 및 Reranking | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.5 | `06.Evaluation` | RAG 성능 평가 | [06.Evaluation](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/06.Evaluation) |
+| Chapter.6 | `07.SingleAgent` | LangGraph를 활용한 AI Agent 만들기 | [07.SingleAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/07.SingleAgent) |
+| Chapter.6 | `08.MultiAgent` | 오케스트레이터를 활용한 Multi Agent 만들기 | [08.MultiAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/08.MultiAgent) |
 
 
 ## 실행 방법
@@ -116,18 +116,12 @@ TAVILY_API_KEY=tvly-...
 
 *14. 검색 품질을 높이는 인덱싱 전략과 Contextual Retrieval*
 
-### Chapter.6
-
 *15. 복잡한 질문에 대응하는 Retrieval 고도화: Hybrid Search와 Reranking*
-
-### Chapter.7
 
 *16. 생성 결과를 검증하고 개선하는 방법*
 
-### Chapter.8
+### Chapter.6
 
 *17. Agent로 판단하고 실행하는 AI Workflow 적용*
-
-### Chapter.9
 
 *18. 복잡한 문제 해결을 위한 Multi Agent 적용*

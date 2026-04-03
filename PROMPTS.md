@@ -339,3 +339,31 @@ Data 폴더 하위에 AXCompass.pdf에 역량 진단 검사 결과의 유형에 
 Backend를 도커로 배포하려고해. streamlit은 streamlit cloud로 배포하려고해.
 ```
 
+### Chapter.5
+
+#### 5-1.인덱싱 파이프라인 고도화 및 Contextual Retrieval
+
+```
+```
+
+#### 5-2.Hybrid Search 및 Reranking
+
+```
+```
+
+#### 5-3.RAG 성능 평가
+
+```
+```
+
+### Chapter.6
+
+#### 6-1.LangGraph를 활용한 AI Agent 만들기
+
+```
+```
+
+#### 6-2.오케스트레이터를 활용한 Multi Agent 만들기
+
+```
+```
