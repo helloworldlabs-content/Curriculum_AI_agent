@@ -13,7 +13,7 @@
 | Chapter.2 | `02.terminal_tetris` | 터미널 콘솔 스타일 테트리스 만들기 | [02.terminal_tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/02.terminal_tetris) |
 | Chapter.2 | `03.ax_curriculum_chatbot` | 기업교육 커리큘럼 생성 챗봇 만들기 | [03.ax_curriculum_chatbot](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/03.ax_curriculum_chatbot) |
 | Chapter.3 | `04.RAG` | LangChain을 활용하여 챗봇에 RAG 적용하기 | [04.RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/04.RAG) |
-| Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 및 배포 실습 | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 및 Docker 배포 실습 | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
 | Chapter.5 | `05.Advanced_RAG` | 인덱싱 파이프라인 고도화 및 Contextual Retrieval | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
 | Chapter.6 | `05.Advanced_RAG` | Hybrid Search 및 Reranking | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
 | Chapter.7 | `06.Evaluation` | RAG 성능 평가 | [06.Evaluation](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/06.Evaluation) |
