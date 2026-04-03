@@ -8,17 +8,17 @@
 
 | 챕터 | 폴더명 | 실습 내용 | 바로가기 |
 |:---:|:---:|:---:|:---:|
-| Chapter.2 | `00.tetris` | 간단한 프롬프트로 테트리스 만들기 | 00.tetris(https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/00.tetris) |
-| Chapter.2 | `01.tetris` | 설계된 프롬프트로 테트리스 만들기 |
-| Chapter.2 | `02.terminal_tetris` | 터미널 콘솔 스타일 테트리스 만들기 |
-| Chapter.2 | `03.ax_curriculum_chatbot` | 기업교육 커리큘럼 생성 챗봇 만들기 |
-| Chapter.3 | `04.RAG` | LangChain을 활용하여 챗봇에 RAG 적용하기 |
-| Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 & Streamlit Cloud, Docker, Ngrok으로 서비스 배포하기 |
-| Chapter.5 | `05.Advanced_RAG` | 인덱싱 파이프라인 고도화 & Contextual Retrieval |
-| Chapter.6 | `05.Advanced_RAG` | Hybrid Search & Reranking |
-| Chapter.7 | `06.Evaluation` | RAG 성능 평가 |
-| Chapter.8 | `07.SingleAgent` | LangGraph를 활용한 AI Agent 만들기 |
-| Chapter.9 | `08.MultiAgent` | 오케스트레이터를 활용한 Multi Agent 만들기 |
+| Chapter.2 | `00.tetris` | 간단한 프롬프트로 테트리스 만들기 | [00.tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/00.tetris) |
+| Chapter.2 | `01.tetris` | 설계된 프롬프트로 테트리스 만들기 | [01.tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/01.tetris) |
+| Chapter.2 | `02.terminal_tetris` | 터미널 콘솔 스타일 테트리스 만들기 | [02.terminal_tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/02.terminal_tetris) |
+| Chapter.2 | `03.ax_curriculum_chatbot` | 기업교육 커리큘럼 생성 챗봇 만들기 | [03.ax_curriculum_chatbot](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/03.ax_curriculum_chatbot) |
+| Chapter.3 | `04.RAG` | LangChain을 활용하여 챗봇에 RAG 적용하기 | [04.RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/04.RAG) |
+| Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 & Streamlit Cloud, Docker, Ngrok으로 서비스 배포하기 | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.5 | `05.Advanced_RAG` | 인덱싱 파이프라인 고도화 & Contextual Retrieval | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.6 | `05.Advanced_RAG` | Hybrid Search & Reranking | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.7 | `06.Evaluation` | RAG 성능 평가 | [06.Evaluation](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/06.Evaluation) |
+| Chapter.8 | `07.SingleAgent` | LangGraph를 활용한 AI Agent 만들기 | [07.SingleAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/07.SingleAgent) |
+| Chapter.9 | `08.MultiAgent` | 오케스트레이터를 활용한 Multi Agent 만들기 | [08.MultiAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/08.MultiAgent) |
 
 
 ## 📖 교안 목차
