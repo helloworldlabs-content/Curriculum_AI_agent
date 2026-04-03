@@ -18,6 +18,7 @@ class ChatResponse(BaseModel):
     reply: str
     complete: bool
     curriculum: dict | None = None
+    validation_result: str | None = None  # "PASS" / "FAIL: ..." / None(검증 미실행)
 
 
 # 커리큘럼 구성 단위

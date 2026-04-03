@@ -89,6 +89,8 @@ def init_session_state():
             }
         ],
         "curriculum_plan": None,
+        "curriculum_complete": True,
+        "curriculum_validation": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -218,6 +220,19 @@ def render_curriculum():
 
     st.divider()
 
+    # ── 0. 검증 상태 배너 ────────────────────────────────────────────
+    is_complete = st.session_state.get("curriculum_complete", True)
+    if not is_complete:
+        validation = st.session_state.get("curriculum_validation", "")
+        fail_lines = [l.strip() for l in validation.splitlines() if l.strip().startswith("-")]
+        detail = "\n".join(fail_lines) if fail_lines else ""
+        st.warning(
+            "**임시 결과** — 구조 검증을 통과하지 못한 커리큘럼입니다. "
+            "수정 요청을 입력하면 재생성합니다."
+            + (f"\n\n검증 실패 사유:\n{detail}" if detail else ""),
+            icon="⚠️",
+        )
+
     # ── 1. 과정 개요 배너 ────────────────────────────────────────────
     st.markdown(
         f'<div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);'
@@ -343,12 +358,29 @@ def handle_user_message(user_text: str):
         return
 
     if result.get("curriculum"):
+        complete = result.get("complete", False)
+        validation_result = result.get("validation_result") or ""
         st.session_state.curriculum_plan = result["curriculum"]
-        # 커리큘럼이 생성된 경우 긴 텍스트 대신 안내 메시지만 채팅에 표시
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": "커리큘럼이 생성되었습니다! 아래에서 확인하세요. 수정이 필요하시면 말씀해 주세요.",
-        })
+        st.session_state.curriculum_complete = complete
+        st.session_state.curriculum_validation = validation_result
+
+        if complete:
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": "커리큘럼이 생성되었습니다! 아래에서 확인하세요. 수정이 필요하시면 말씀해 주세요.",
+            })
+        else:
+            # 검증 실패: 검증 사유를 사용자에게 노출
+            fail_lines = [l for l in validation_result.splitlines() if l.strip().startswith("-")]
+            fail_summary = "\n".join(fail_lines) if fail_lines else "구조 검증에 실패했습니다."
+            st.session_state.messages.append({
+                "role": "assistant",
+                "content": (
+                    "커리큘럼이 생성되었으나 구조 검증을 통과하지 못했습니다. "
+                    "아래에서 임시 결과를 확인하실 수 있으며, 수정 요청 시 재생성합니다.\n\n"
+                    f"**검증 실패 사유:**\n{fail_summary}"
+                ),
+            })
     else:
         st.session_state.messages.append({"role": "assistant", "content": result["reply"]})
 
