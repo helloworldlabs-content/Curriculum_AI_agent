@@ -286,12 +286,7 @@ def retrieve_group_context(
         vectorstore,
         query,
         k=max(4, len(type_names) * 2),
-        search_filter={
-            "$and": [
-                {"doc_type": {"$eq": "ax_compass"}},
-                {"type_name": {"$in": type_names}},
-            ]
-        },
+        search_filter={"doc_type": {"$eq": "ax_compass"}},
         label=f"{group_label}_ax",
         corpus_cache=corpus_cache,
     )

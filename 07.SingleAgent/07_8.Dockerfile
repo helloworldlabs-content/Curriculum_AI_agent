@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY 07.SingleAgent/07_2.AgentSchemas.py ./07_2.AgentSchemas.py
 COPY 07.SingleAgent/07_3.AgentHelpers.py ./07_3.AgentHelpers.py
 COPY 07.SingleAgent/07_4.SingleAgent.py  ./07_4.SingleAgent.py
+COPY 07.SingleAgent/07_10.SystemPrompt.txt ./07_10.SystemPrompt.txt
 COPY 07.SingleAgent/07_5.Auth.py         ./07_5.Auth.py
 COPY 07.SingleAgent/07_6.Main.py         ./main.py
 

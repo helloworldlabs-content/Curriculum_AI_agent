@@ -18,14 +18,21 @@ class ChatResponse(BaseModel):
     reply: str
     complete: bool
     curriculum: dict | None = None
+    validation_result: str | None = None  # "PASS" / "FAIL: ..." / None(검증 미실행)
 
 
 # 커리큘럼 구성 단위
 class Session(BaseModel):
     title: str
+    session_type: str = "공통 이론"   # 공통 이론 / 공통 실습 / 그룹별 프로젝트 / 그룹별 심화 적용
+    target: str = "전체"              # 대상 (전체 / 그룹 A 등)
     duration_hours: float
-    goals: list[str]
-    activities: list[str]
+    purpose: str = ""                 # 세션 목적
+    goals: list[str] = Field(default_factory=list)     # 학습목표
+    contents: list[str] = Field(default_factory=list)  # 학습내용
+    activities: list[str] = Field(default_factory=list)  # 하위 호환 (goals/contents가 없을 때 대체)
+    method: str = ""                  # 진행 방식
+    expected_effect: str = ""         # 기대효과
 
 
 class GroupInfo(BaseModel):

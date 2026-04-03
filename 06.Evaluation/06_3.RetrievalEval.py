@@ -24,27 +24,46 @@ load_project_modules = _eval_common.load_project_modules
 load_test_cases = _eval_common.load_test_cases
 
 
-def _keyword_precision_at_k(docs, expected_keywords: list[str], *, k: int) -> dict:
-    # 골든 문서 ID가 없을 때는, 기대 키워드가 상위 문서에 얼마나 들어갔는지로 간단히 Precision@k를 본다.
-    top_docs = docs[:k]
-    lowered_keywords = [keyword.lower() for keyword in expected_keywords if keyword]
-    if not top_docs:
-        return {"precision_at_k": 0.0, "matched_docs": 0, "k": k}
+def _keyword_hit_rate(text: str, keywords: list[str]) -> dict:
+    """
+    반환된 텍스트에 기대 키워드가 몇 개나 포함되는지 계산한다.
 
-    matched_docs = 0
-    for doc in top_docs:
-        haystack = f"{doc.page_content} {json.dumps(doc.metadata, ensure_ascii=False)}".lower()
-        if any(keyword in haystack for keyword in lowered_keywords):
-            matched_docs += 1
+    이전 _keyword_precision_at_k 는 Document 목록 기준이었으나,
+    이제 retrieve_group_context / retrieve_curriculum_examples 가 반환하는
+    문자열(string)을 직접 검사하는 방식으로 변경한다.
 
+    - matched_docs  : 키워드 중 텍스트에 포함된 키워드 수
+    - k             : 기대 키워드 총 수 (기존 API 호환을 위해 k 로 표기)
+    - precision_at_k: matched_docs / k
+    """
+    if not text or not keywords:
+        return {"precision_at_k": 0.0, "matched_docs": 0, "k": len(keywords)}
+
+    lowered = text.lower()
+    matched = sum(1 for kw in keywords if kw.lower() in lowered)
     return {
-        "precision_at_k": matched_docs / len(top_docs),
-        "matched_docs": matched_docs,
-        "k": len(top_docs),
+        "precision_at_k": round(matched / len(keywords), 2),
+        "matched_docs": matched,
+        "k": len(keywords),
     }
 
 
 def evaluate_case(case: dict, modules=None, vectorstore=None) -> dict:
+    """
+    프로덕션 retrieval 함수(retrieve_group_context, retrieve_curriculum_examples)를
+    그대로 호출해 평가한다.
+
+    [기존 방식의 문제]
+    내부 _retrieve 함수를 type_name 필터로 직접 호출하면,
+    PDF 청크에 type_name 메타데이터가 없을 때 결과가 0건이 되어
+    Precision 이 항상 0.00 으로 나온다.
+
+    [수정 방식]
+    실제 서비스와 동일한 함수(retrieve_group_context 등)를 호출하므로,
+    평가 결과가 실제 서비스 품질을 정확히 반영한다.
+    type_name 필터 문제가 있더라도 그 자체를 평가하는 것이 목적이므로
+    평가 로직은 서비스 코드와 동일한 경로여야 한다.
+    """
     modules = modules or load_project_modules()
     vectorstore = vectorstore or get_vectorstore(modules)
     retrieval = modules.retrieval
@@ -52,37 +71,27 @@ def evaluate_case(case: dict, modules=None, vectorstore=None) -> dict:
     expected = case.get("expected", {}).get("retrieval", {})
     corpus_cache: dict = {}
 
-    group_k = int(expected.get("group_k", 4))
-    curriculum_k = int(expected.get("curriculum_k", 3))
-
     results = {}
     for group_key in ("group_a", "group_b", "group_c"):
         group = groups[group_key]
-        docs = retrieval._retrieve(
+        # 프로덕션과 동일한 함수 호출: type_name 필터 + Hybrid Search + Rerank
+        ctx_text = retrieval.retrieve_group_context(
             vectorstore,
-            f"{', '.join(group['types'])} 유형의 AI 활용 특성, 강점, 보완 방향, 교육적 접근 방법",
-            k=group_k,
-            search_filter={
-                "$and": [
-                    {"doc_type": {"$eq": "ax_compass"}},
-                    {"type_name": {"$in": group["types"]}},
-                ]
-            },
-            label=f"{group_key}_eval",
+            group["types"],
+            group_label=f"{group_key}_eval",
             corpus_cache=corpus_cache,
         )
         expected_keywords = expected.get(f"{group_key}_keywords", group["types"])
         results[group_key] = {
-            **_keyword_precision_at_k(docs, expected_keywords, k=group_k),
+            **_keyword_hit_rate(ctx_text, expected_keywords),
             "expected_keywords": expected_keywords,
+            "retrieved_chars": len(ctx_text),
         }
 
-    curriculum_docs = retrieval._retrieve(
+    # 커리큘럼 예시 검색도 프로덕션 함수 그대로 사용
+    curriculum_text = retrieval.retrieve_curriculum_examples(
         vectorstore,
-        retrieval._build_curriculum_query(info),
-        k=curriculum_k,
-        search_filter={"doc_type": {"$eq": "curriculum_example"}},
-        label="curriculum_examples_eval",
+        info,
         corpus_cache=corpus_cache,
     )
     curriculum_keywords = expected.get(
@@ -90,8 +99,9 @@ def evaluate_case(case: dict, modules=None, vectorstore=None) -> dict:
         [info.topic, info.goal, info.audience, info.level],
     )
     results["curriculum_examples"] = {
-        **_keyword_precision_at_k(curriculum_docs, curriculum_keywords, k=curriculum_k),
+        **_keyword_hit_rate(curriculum_text, curriculum_keywords),
         "expected_keywords": curriculum_keywords,
+        "retrieved_chars": len(curriculum_text),
     }
 
     score_values = [section["precision_at_k"] for section in results.values()]

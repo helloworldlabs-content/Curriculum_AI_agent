@@ -73,6 +73,7 @@ def chat(req: ChatRequest, _: str = Depends(verify_token)):
             reply=result["reply"],
             complete=result["complete"],
             curriculum=result.get("curriculum"),
+            validation_result=result.get("validation_result"),
         )
     except Exception as error:
         logger.exception("[chat] error: %s", error)
