@@ -63,7 +63,7 @@
 
 ### Chapter.6
 
-**15.복잡한 질문에 대응하는 Retrieval 고도화: Hybrid Search와 Reranking**
+*15.복잡한 질문에 대응하는 Retrieval 고도화: Hybrid Search와 Reranking*
 
 ### Chapter.7
 
