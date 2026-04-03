@@ -2,6 +2,25 @@
 
 ---
 
+## 실습 결과 폴더 안내
+
+각 챕터의 실습 결과물과 실습 내용은 다음과 같습니다.
+
+| 챕터 | 폴더명 | 실습 내용 | 바로가기 |
+|:---:|:---:|:---:|:---:|
+| Chapter.2 | `00.tetris` | 간단한 프롬프트로 테트리스 만들기 | [00.tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/00.tetris) |
+| Chapter.2 | `01.tetris` | 설계된 프롬프트로 테트리스 만들기 | [01.tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/01.tetris) |
+| Chapter.2 | `02.terminal_tetris` | 터미널 콘솔 스타일 테트리스 만들기 | [02.terminal_tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/02.terminal_tetris) |
+| Chapter.2 | `03.ax_curriculum_chatbot` | 기업교육 커리큘럼 생성 챗봇 만들기 | [03.ax_curriculum_chatbot](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/03.ax_curriculum_chatbot) |
+| Chapter.3 | `04.RAG` | LangChain을 활용하여 챗봇에 RAG 적용하기 | [04.RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/04.RAG) |
+| Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 및 배포 실습 | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.5 | `05.Advanced_RAG` | 인덱싱 파이프라인 고도화 및 Contextual Retrieval | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.6 | `05.Advanced_RAG` | Hybrid Search 및 Reranking | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
+| Chapter.7 | `06.Evaluation` | RAG 성능 평가 | [06.Evaluation](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/06.Evaluation) |
+| Chapter.8 | `07.SingleAgent` | LangGraph를 활용한 AI Agent 만들기 | [07.SingleAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/07.SingleAgent) |
+| Chapter.9 | `08.MultiAgent` | 오케스트레이터를 활용한 Multi Agent 만들기 | [08.MultiAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/08.MultiAgent) |
+
+
 ## 실행 방법
 
 이 저장소는 루트 기준으로 `.venv` 가상환경을 만든 뒤, 공통 의존성을 설치하고 각 폴더별 예제를 실행하는 방식으로 사용하는 것을 권장합니다.
@@ -56,24 +75,6 @@ TAVILY_API_KEY=tvly-...
 | `08.MultiAgent` 백엔드 | Multi Agent FastAPI 서버 | `python 08.MultiAgent/08_8.Main.py` |
 | `08.MultiAgent` 프런트 | Multi Agent Streamlit UI | `streamlit run 08.MultiAgent/08_9.Streamlit.py` |
 
-
-## 실습 결과 폴더 안내
-
-각 챕터의 실습 결과물과 실습 내용은 다음과 같습니다.
-
-| 챕터 | 폴더명 | 실습 내용 | 바로가기 |
-|:---:|:---:|:---:|:---:|
-| Chapter.2 | `00.tetris` | 간단한 프롬프트로 테트리스 만들기 | [00.tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/00.tetris) |
-| Chapter.2 | `01.tetris` | 설계된 프롬프트로 테트리스 만들기 | [01.tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/01.tetris) |
-| Chapter.2 | `02.terminal_tetris` | 터미널 콘솔 스타일 테트리스 만들기 | [02.terminal_tetris](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/02.terminal_tetris) |
-| Chapter.2 | `03.ax_curriculum_chatbot` | 기업교육 커리큘럼 생성 챗봇 만들기 | [03.ax_curriculum_chatbot](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/03.ax_curriculum_chatbot) |
-| Chapter.3 | `04.RAG` | LangChain을 활용하여 챗봇에 RAG 적용하기 | [04.RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/04.RAG) |
-| Chapter.4 | `05.Advanced_RAG` | Streamlit 화면 구성 및 배포 실습 | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
-| Chapter.5 | `05.Advanced_RAG` | 인덱싱 파이프라인 고도화 및 Contextual Retrieval | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
-| Chapter.6 | `05.Advanced_RAG` | Hybrid Search 및 Reranking | [05.Advanced_RAG](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/05.Advanced_RAG) |
-| Chapter.7 | `06.Evaluation` | RAG 성능 평가 | [06.Evaluation](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/06.Evaluation) |
-| Chapter.8 | `07.SingleAgent` | LangGraph를 활용한 AI Agent 만들기 | [07.SingleAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/07.SingleAgent) |
-| Chapter.9 | `08.MultiAgent` | 오케스트레이터를 활용한 Multi Agent 만들기 | [08.MultiAgent](https://github.com/helloworldlabs-content/Curriculum_AI_agent/tree/main/08.MultiAgent) |
 
 ## 교안 목차
 
