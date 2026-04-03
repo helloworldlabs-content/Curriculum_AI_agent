@@ -3,12 +3,13 @@ pygame
 streamlit
 requests
 
-# LangChain
+# LangChain / LangGraph
 langchain
 langchain-openai
 langchain-chroma
 langchain-community
 langchain-text-splitters
+langgraph
 rank_bm25
 flashrank
 pypdf

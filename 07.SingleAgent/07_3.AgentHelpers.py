@@ -271,28 +271,39 @@ GENERATION_SYSTEM_PROMPT = dedent(
     수집된 요구사항과 AX Compass 진단 결과를 바탕으로 맞춤형 교육 커리큘럼을 하루 단위로 설계해라.
 
     출력 구조 (반드시 준수):
-    - groups: 3개 그룹의 메타 정보 (group_name, target_types, participant_count, focus_description)
+    - groups: 실제 인원이 있는 그룹만 생성한다. (group_name, target_types, participant_count, focus_description)
     - daily_schedules: 교육 기간 N일 각각에 대해 DaySchedule 1개씩 반드시 생성한다.
       - day: 1부터 시작하는 일차 번호
       - theme: 해당 일의 핵심 주제 (한 줄)
-      - common_sessions: 모든 그룹이 함께 수강하는 공통 세션 목록
-      - group_sessions: 3개 그룹(그룹 A/B/C)이 각각 진행하는 세션 목록
-        - group_name: 그룹 이름 (그룹 A, 그룹 B, 그룹 C)
+      - common_sessions: 모든 참여자가 함께 수강하는 공통 세션 목록
+      - group_sessions: 실제 인원이 있는 그룹만 생성. 그룹별 세션이 있는 일차에는 모든 그룹이 병렬 참여.
+        - group_name: 그룹 이름
         - sessions: 해당 그룹의 세션 목록
 
+    세션 필드 (모든 세션에 반드시 포함):
+    - title: 실제 강의 제목처럼 구체적인 세션명
+    - session_type: "공통 이론" / "공통 실습" / "그룹별 프로젝트" / "그룹별 심화 적용" 중 하나
+    - target: 대상 ("전체" 또는 "그룹 A" 등 실제 그룹명)
+    - duration_hours: 진행 시간 (소수점 0.5 단위)
+    - purpose: 이 세션을 편성한 목적 (1~2문장)
+    - goals: 학습목표 — 수업 후 학습자가 설명·판단·수행·적용할 수 있는 행동 중심으로 3개 이상
+    - contents: 학습내용 — 무엇을 어떤 순서로 다루고 어떤 예시·활동이 포함되는지 3개 이상
+    - method: 진행 방식 (강의, 실습, 토의, 발표, 팀 프로젝트 등 구체적으로)
+    - expected_effect: 기대효과 — 업무 적용 가능성, 실무 역량 향상, 문제 해결력 강화 관점으로 서술
+
     시간 규칙:
-    - 각 일차의 common_sessions 합계 + 한 그룹 sessions 합계 = hours_per_day (하루 교육 시간)
-    - 세 그룹의 sessions 시간 합계는 동일해야 한다 (내용은 달라도 됨).
-    - 교육이 없는 날은 만들지 않는다. 반드시 days 수만큼의 DaySchedule을 생성한다.
+    - 각 일차의 common_sessions 합계 + 한 그룹 sessions 합계 = hours_per_day
+    - 그룹별 세션이 있는 일차에서 모든 그룹의 sessions 시간 합계는 동일해야 한다.
+    - 반드시 days 수만큼의 DaySchedule을 생성한다.
 
     설계 규칙:
     1. 일차별 주제(theme)가 자연스럽게 이어지도록 전체 흐름을 먼저 구성한다.
-    2. 초반 일차는 이론·공통 세션 비중을 높이고, 후반 일차는 그룹별 실습 비중을 높인다.
-    3. 그룹별 세션은 해당 유형의 강점을 활용하고 보완 방향을 반영해 설계한다.
-    4. 각 세션은 title, duration_hours, goals, activities를 포함한다.
-    5. 기업 교육답게 업무 적용 중심으로 구성한다.
+    2. 공통 실습은 도구 기능 익히기·기본 예제 수준까지만 허용하고, 실무 적용·결과물 제작은 그룹별로만 편성한다.
+    3. 그룹별 세션이 편성된 일차에는 실제 인원이 있는 모든 그룹이 같은 시간대에 병렬 참여한다.
+    4. 그룹별 세션은 그룹마다 세션명·학습목표·학습내용·기대효과가 실질적으로 달라야 한다.
+    5. 교육 대상자의 직무·업무 맥락에 맞는 예시·실습·산출물을 반영한다.
     6. notes에는 유형별 특성과 기업 제약사항을 반영한 주의사항을 적는다.
-    7. 참고 자료가 주어져도 내용을 그대로 복사하지 말고 현재 기업 상황에 맞게 재구성한다.
+    7. 참고 자료는 참고만 하고 현재 기업 상황에 맞게 재구성한다.
     """
 ).strip()
 
