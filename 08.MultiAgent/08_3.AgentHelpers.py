@@ -338,6 +338,195 @@ def _correct_hours_daily(result, hours_per_day: float):
     return result
 
 
+def validate_curriculum_result(curriculum_dict: dict, info_dict: dict) -> str:
+    """
+    생성된 커리큘럼의 구조적 무결성을 검사한다.
+    Critical 위반이 없으면 "PASS", 있으면 "FAIL: [문제 목록]" 형식으로 반환한다.
+    """
+    hours_per_day = float(info_dict.get("hours_per_day", 8))
+    days = int(info_dict.get("days", 1))
+
+    group_counts = {
+        "그룹 A": info_dict.get("count_balanced", 0) + info_dict.get("count_learner", 0),
+        "그룹 B": info_dict.get("count_overconfident", 0) + info_dict.get("count_doer", 0),
+        "그룹 C": info_dict.get("count_analyst", 0) + info_dict.get("count_cautious", 0),
+    }
+    active_groups = {name for name, count in group_counts.items() if count > 0}
+
+    failures: list[str] = []
+    warnings: list[str] = []
+
+    # ── Group E: 전체 구조 ────────────────────────────────────────────
+    if not curriculum_dict.get("program_title"):
+        failures.append("program_title이 비어있습니다")
+
+    daily = curriculum_dict.get("daily_schedules", [])
+    if len(daily) != days:
+        failures.append(f"daily_schedules가 {len(daily)}개인데 {days}개여야 합니다")
+
+    groups_in_plan = {g.get("group_name") for g in curriculum_dict.get("groups", [])}
+    missing_groups = active_groups - groups_in_plan
+    if missing_groups:
+        failures.append(f"인원이 있는 그룹이 groups에 누락됨: {sorted(missing_groups)}")
+    unexpected_groups = groups_in_plan - active_groups
+    if unexpected_groups:
+        failures.append(f"인원이 없는 그룹이 groups에 포함됨: {sorted(unexpected_groups)}")
+
+    # ── 일차별 검사 ───────────────────────────────────────────────────
+    group_types = {"그룹별 프로젝트", "그룹별 심화 적용"}
+
+    for day_data in daily:
+        day_num = day_data.get("day", "?")
+        common_sessions = day_data.get("common_sessions", [])
+        group_sessions = day_data.get("group_sessions", [])
+
+        common_total = sum(s.get("duration_hours", 0) for s in common_sessions)
+        group_hours_list = [
+            sum(s.get("duration_hours", 0) for s in gs.get("sessions", []))
+            for gs in group_sessions
+        ]
+        group_total = group_hours_list[0] if group_hours_list else 0.0
+        day_total = common_total + group_total
+
+        # Group A: 시간 무결성
+        if abs(day_total - hours_per_day) > 0.1:
+            failures.append(
+                f"{day_num}일차 시간 오류: common {common_total}h + group {group_total}h "
+                f"= {day_total}h (기대값: {hours_per_day}h)"
+            )
+
+        if len(group_hours_list) > 1 and (max(group_hours_list) - min(group_hours_list)) > 0.1:
+            failures.append(
+                f"{day_num}일차 그룹 간 시간 불균형: {group_hours_list}"
+            )
+
+        # Group B: 그룹 커버리지
+        if group_sessions:
+            groups_in_day = {gs.get("group_name") for gs in group_sessions}
+            missing = active_groups - groups_in_day
+            if missing:
+                failures.append(f"{day_num}일차 그룹 세션에서 누락된 그룹: {sorted(missing)}")
+            extra = groups_in_day - active_groups
+            if extra:
+                failures.append(f"{day_num}일차 인원이 없는 그룹이 포함됨: {sorted(extra)}")
+
+        # Group C: 세션 타입 규칙
+        for s in common_sessions:
+            if s.get("session_type") in group_types:
+                failures.append(
+                    f"{day_num}일차 공통 세션 '{s.get('title', '')}': session_type이 "
+                    f"'{s.get('session_type')}' — 공통 세션은 '공통 이론' 또는 '공통 실습'이어야 합니다"
+                )
+
+        for gs in group_sessions:
+            for s in gs.get("sessions", []):
+                if s.get("session_type") not in group_types:
+                    failures.append(
+                        f"{day_num}일차 그룹 세션 '{s.get('title', '')}': session_type이 "
+                        f"'{s.get('session_type')}' — 그룹 세션은 '그룹별 프로젝트' 또는 '그룹별 심화 적용'이어야 합니다"
+                    )
+
+        # Group D: 내용 충실도 (Warning only)
+        all_sessions = list(common_sessions)
+        for gs in group_sessions:
+            all_sessions.extend(gs.get("sessions", []))
+
+        for s in all_sessions:
+            title = s.get("title", "?")
+            if len(s.get("goals", [])) < 3:
+                warnings.append(f"'{title}' goals가 3개 미만 ({len(s.get('goals', []))}개)")
+            if len(s.get("contents", [])) < 3:
+                warnings.append(f"'{title}' contents가 3개 미만 ({len(s.get('contents', []))}개)")
+
+    if failures:
+        report = "FAIL:\n" + "\n".join(f"- {f}" for f in failures)
+        if warnings:
+            report += "\n\n[Warning — 재생성 불필요, 참고만]\n" + "\n".join(f"- {w}" for w in warnings)
+        return report
+
+    report = "PASS"
+    if warnings:
+        report += "\n\n[Warning — 재생성 불필요, 참고만]\n" + "\n".join(f"- {w}" for w in warnings)
+    return report
+
+
+def evaluate_structure(curriculum_dict: dict, info_dict: dict) -> dict:
+    """
+    EvaluatorAgent용 구조/산술 검증.
+    시간 합계와 그룹 커버리지를 코드로 계산하여 결과를 반환한다.
+    LLM은 이 결과를 받아 정성 평가(feasibility, condition_fit)만 수행한다.
+
+    Returns
+    -------
+    dict
+        {
+            "time_constraint_ok": bool,
+            "group_balance_ok": bool,
+            "time_issues": list[str],   # 시간 오류 상세 (feedback용)
+            "group_issues": list[str],  # 그룹 오류 상세 (feedback용)
+            "time_summary": str,        # 일차별 시간 합계 요약 (LLM 컨텍스트용)
+        }
+    """
+    hours_per_day = float(info_dict.get("hours_per_day", 8))
+
+    group_counts = {
+        "그룹 A": info_dict.get("count_balanced", 0) + info_dict.get("count_learner", 0),
+        "그룹 B": info_dict.get("count_overconfident", 0) + info_dict.get("count_doer", 0),
+        "그룹 C": info_dict.get("count_analyst", 0) + info_dict.get("count_cautious", 0),
+    }
+    active_groups = {name for name, count in group_counts.items() if count > 0}
+
+    time_issues: list[str] = []
+    group_issues: list[str] = []
+    time_summary_lines: list[str] = []
+
+    for day_data in curriculum_dict.get("daily_schedules", []):
+        day_num = day_data.get("day", "?")
+        common_sessions = day_data.get("common_sessions", [])
+        group_sessions  = day_data.get("group_sessions", [])
+
+        common_total = round(sum(s.get("duration_hours", 0) for s in common_sessions), 2)
+        group_hours_list = [
+            round(sum(s.get("duration_hours", 0) for s in gs.get("sessions", [])), 2)
+            for gs in group_sessions
+        ]
+        group_total = group_hours_list[0] if group_hours_list else 0.0
+        day_total   = round(common_total + group_total, 2)
+
+        # 시간 무결성
+        time_summary_lines.append(
+            f"{day_num}일차: common {common_total}h + group {group_total}h = {day_total}h "
+            f"(기준 {hours_per_day}h) → {'OK' if abs(day_total - hours_per_day) <= 0.5 else 'FAIL'}"
+        )
+        if abs(day_total - hours_per_day) > 0.5:
+            time_issues.append(
+                f"{day_num}일차: common_sessions {common_total}h + 그룹 sessions {group_total}h "
+                f"= {day_total}h인데 hours_per_day는 {hours_per_day}h입니다."
+            )
+        if len(group_hours_list) > 1 and (max(group_hours_list) - min(group_hours_list)) > 0.5:
+            time_issues.append(
+                f"{day_num}일차: 그룹 간 시간 불균형 {group_hours_list}"
+            )
+
+        # 그룹 커버리지 (인원이 있는 그룹만)
+        if group_sessions:
+            groups_in_day = {gs.get("group_name") for gs in group_sessions}
+            missing = active_groups - groups_in_day
+            if missing:
+                group_issues.append(
+                    f"{day_num}일차: 인원이 있는 그룹 {sorted(missing)}이 그룹 세션에 누락되어 있습니다."
+                )
+
+    return {
+        "time_constraint_ok": len(time_issues) == 0,
+        "group_balance_ok":   len(group_issues) == 0,
+        "time_issues":        time_issues,
+        "group_issues":       group_issues,
+        "time_summary":       "\n".join(time_summary_lines),
+        "active_groups":      sorted(active_groups),
+    }
+
+
 def generate_curriculum(
     info_dict: dict,
     *,

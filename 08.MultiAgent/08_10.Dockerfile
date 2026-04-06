@@ -12,8 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 백엔드 소스 복사
 COPY 08.MultiAgent/08_2.AgentSchemas.py ./08_2.AgentSchemas.py
 COPY 08.MultiAgent/08_3.AgentHelpers.py ./08_3.AgentHelpers.py
-COPY 08.MultiAgent/08_4.InfoCollectorAgent.py ./08_4.InfoCollectorAgent.py
-COPY 08.MultiAgent/08_5.CurriculumAgent.py    ./08_5.CurriculumAgent.py
+COPY 08.MultiAgent/08_4.InfoCollectorAgent.py   ./08_4.InfoCollectorAgent.py
+COPY 08.MultiAgent/08_5.CurriculumAgent.py      ./08_5.CurriculumAgent.py
+COPY 08.MultiAgent/08_12.InfoCollectorPrompt.txt    ./08_12.InfoCollectorPrompt.txt
+COPY 08.MultiAgent/08_13.CurriculumAgentPrompt.txt  ./08_13.CurriculumAgentPrompt.txt
+COPY 08.MultiAgent/08_14.EvaluatorAgentPrompt.txt   ./08_14.EvaluatorAgentPrompt.txt
 COPY 08.MultiAgent/08_6.EvaluatorAgent.py     ./08_6.EvaluatorAgent.py
 COPY 08.MultiAgent/08_7.Orchestrator.py       ./08_7.Orchestrator.py
 COPY 08.MultiAgent/08_8.Main.py               ./main.py

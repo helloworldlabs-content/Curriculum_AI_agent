@@ -1,7 +1,6 @@
 import json
 import os
 
-import pandas as pd
 import requests
 import streamlit as st
 from dotenv import load_dotenv
@@ -93,6 +92,7 @@ def init_session_state():
         "messages": [{"role": "assistant", "content": _WELCOME}],
         "orchestrator_state": dict(_DEFAULT_STATE),
         "curriculum_plan": None,
+        "curriculum_validated": True,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -181,7 +181,15 @@ def render_evaluation_history():
             badge_cols = st.columns(4)
             for col, (key, name) in zip(badge_cols, EVAL_KEYS):
                 ok = record.get(key, True)
-                col.metric(name, "✅ 통과" if ok else "❌ 미통과")
+                # 현실성 항목: 점수 기반 판단이면 점수도 함께 표시
+                if key == "feasibility_ok":
+                    score = record.get("feasibility_score", -1)
+                    if score >= 0:
+                        col.metric(name, "✅ 통과" if ok else "❌ 미통과", f"{score}/10점")
+                    else:
+                        col.metric(name, "✅ 통과" if ok else "❌ 미통과", "사례 비교")
+                else:
+                    col.metric(name, "✅ 통과" if ok else "❌ 미통과")
 
             st.markdown(f"**평가 요약**\n{record.get('summary', '')}")
 
@@ -201,117 +209,179 @@ def render_messages():
             st.markdown(message["content"])
 
 # ---------------------------------------------------------------------------
-# 표 형식 커리큘럼 렌더러
+# 카드형 커리큘럼 렌더러
 # ---------------------------------------------------------------------------
 
-def _sessions_to_df(common_sessions: list, group_sessions: list) -> pd.DataFrame:
-    """공통 세션과 그룹 세션을 하나의 DataFrame으로 변환한다."""
-    rows = []
-    for s in common_sessions:
-        rows.append({
-            "구분":     "공통",
-            "세션명":   s.get("title", ""),
-            "시간(h)":  s.get("duration_hours", 0),
-            "학습 목표": "\n".join(f"• {g}" for g in s.get("goals", [])),
-            "활동 내용": "\n".join(f"• {a}" for a in s.get("activities", [])),
-        })
-    for gs in group_sessions:
-        group_name = gs.get("group_name", "")
-        for s in gs.get("sessions", []):
-            rows.append({
-                "구분":     group_name,
-                "세션명":   s.get("title", ""),
-                "시간(h)":  s.get("duration_hours", 0),
-                "학습 목표": "\n".join(f"• {g}" for g in s.get("goals", [])),
-                "활동 내용": "\n".join(f"• {a}" for a in s.get("activities", [])),
-            })
-    return pd.DataFrame(rows)
+_SESSION_TYPE_STYLE = {
+    "공통 이론":        ("#dbeafe", "#1e40af", "📖"),
+    "공통 실습":        ("#dcfce7", "#166534", "🛠"),
+    "그룹별 프로젝트":  ("#fef3c7", "#92400e", "🧩"),
+    "그룹별 심화 적용": ("#fce7f3", "#9d174d", "🔬"),
+}
+
+_GROUP_COLORS = {
+    "그룹 A": ("#dbeafe", "#1e40af"),
+    "그룹 B": ("#dcfce7", "#166534"),
+    "그룹 C": ("#fef3c7", "#92400e"),
+}
 
 
-def render_curriculum_table(plan: dict) -> None:
-    """커리큘럼을 표 형식으로 렌더링한다."""
+def _type_badge(session_type: str) -> str:
+    bg, tc, icon = _SESSION_TYPE_STYLE.get(session_type, ("#f1f5f9", "#334155", "📌"))
+    return (
+        f'<span style="background:{bg};color:{tc};padding:2px 8px;'
+        f'border-radius:12px;font-size:0.78em;font-weight:600">'
+        f'{icon} {session_type}</span>'
+    )
+
+
+def _pill(text: str, bg: str = "#f1f5f9", tc: str = "#334155") -> str:
+    return (
+        f'<span style="background:{bg};color:{tc};padding:1px 8px;'
+        f'border-radius:10px;font-size:0.8em;font-weight:500">{text}</span>'
+    )
+
+
+def _render_session_card(session: dict, expanded: bool = False) -> None:
+    s_type   = session.get("session_type", "")
+    title    = session.get("title", "")
+    target   = session.get("target", "전체")
+    hours    = session.get("duration_hours", 0)
+    purpose  = session.get("purpose", "")
+    goals    = session.get("goals", [])
+    contents = session.get("contents") or session.get("activities", [])
+    method   = session.get("method", "")
+    effect   = session.get("expected_effect", "")
+
+    bg, tc, _ = _SESSION_TYPE_STYLE.get(s_type, ("#f1f5f9", "#334155", "📌"))
+
+    header_html = (
+        f'<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
+        f'{_type_badge(s_type)}'
+        f'{_pill(f"👤 {target}")}'
+        f'{_pill(f"⏱ {hours}h", "#f0fdf4", "#166534")}'
+        f'</div>'
+        f'<div style="font-weight:600;font-size:1em;margin-top:4px">{title}</div>'
+    )
+
+    with st.expander(f"{title}  ({hours}h)", expanded=expanded):
+        st.markdown(header_html, unsafe_allow_html=True)
+
+        if purpose:
+            st.markdown(
+                f'<div style="background:{bg};color:{tc};padding:8px 12px;'
+                f'border-radius:6px;margin:8px 0;font-size:0.9em">'
+                f'<strong>목적</strong>  {purpose}</div>',
+                unsafe_allow_html=True,
+            )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if goals:
+                st.markdown("**🎯 학습목표**")
+                for g in goals:
+                    st.markdown(f"- {g}")
+            if method:
+                st.markdown(f"**🔧 진행 방식**  \n{method}")
+        with col2:
+            if contents:
+                st.markdown("**📚 학습내용**")
+                for c in contents:
+                    st.markdown(f"- {c}")
+            if effect:
+                st.markdown(
+                    f'<div style="background:#f0fdf4;border-left:3px solid #22c55e;'
+                    f'padding:6px 10px;border-radius:0 4px 4px 0;margin-top:8px;font-size:0.88em">'
+                    f'<strong>💡 기대효과</strong><br>{effect}</div>',
+                    unsafe_allow_html=True,
+                )
+
+
+def render_curriculum_cards(plan: dict) -> None:
     groups = plan.get("groups", [])
     daily  = plan.get("daily_schedules", [])
 
-    # ── 1. 그룹 구성 표 ──────────────────────────────────────────────
-    st.markdown("#### 👥 그룹 구성")
+    # ── 1. 그룹 구성 ─────────────────────────────────────────────────
     if groups:
-        total = sum(g.get("participant_count", 0) for g in groups)
-        df_groups = pd.DataFrame([{
-            "그룹":     g.get("group_name", ""),
-            "대상 유형": g.get("target_types", ""),
-            "인원":     f"{g.get('participant_count', 0)}명",
-            "교육 방향": g.get("focus_description", ""),
-        } for g in groups])
-        st.dataframe(df_groups, hide_index=True, use_container_width=True)
-        st.caption(f"총 {total}명")
+        with st.expander("👥 그룹별 설계 방향", expanded=False):
+            gcols = st.columns(len(groups))
+            for col, g in zip(gcols, groups):
+                bg, tc = _GROUP_COLORS.get(g["group_name"], ("#f1f5f9", "#334155"))
+                col.markdown(
+                    f'<div style="background:{bg};border-left:3px solid {tc};'
+                    f'padding:10px 12px;border-radius:0 6px 6px 0">'
+                    f'<strong style="color:{tc}">{g["group_name"]}</strong>'
+                    f'<br><span style="font-size:0.85em">{g.get("target_types","")}</span>'
+                    f'<br><br>{g.get("focus_description","")}</div>',
+                    unsafe_allow_html=True,
+                )
 
-    # ── 2. 일차별 세션 표 ────────────────────────────────────────────
-    st.markdown("#### 📅 일차별 세션")
-
+    # ── 2. 일차별 세션 카드 ──────────────────────────────────────────
     if not daily:
         st.warning("일차별 스케줄 데이터가 없습니다.")
         return
 
-    day_tabs = st.tabs([f"Day {d['day']}  —  {d.get('theme', '')}" for d in daily])
+    st.markdown("### 📅 일차별 커리큘럼")
+    day_tabs = st.tabs([f"Day {d['day']}  —  {d.get('theme','')}" for d in daily])
 
     for tab, day in zip(day_tabs, daily):
         with tab:
-            common        = day.get("common_sessions", [])
+            common         = day.get("common_sessions", [])
             group_sessions = day.get("group_sessions", [])
-            common_hours  = sum(s.get("duration_hours", 0) for s in common)
-            group_hours   = sum(
+            common_hours   = sum(s.get("duration_hours", 0) for s in common)
+            group_hours    = sum(
                 s.get("duration_hours", 0)
                 for gs in group_sessions[:1]
                 for s in gs.get("sessions", [])
             )
-            st.caption(f"공통 {common_hours}h  +  그룹별 실습 {group_hours}h  =  총 {common_hours + group_hours}h")
+            total_h = common_hours + group_hours
 
-            df = _sessions_to_df(common, group_sessions)
-            if not df.empty:
-                # 구분 컬럼 색상 강조를 위해 스타일 적용
-                group_colors = {
-                    "공통":   "#e8f5e9",
-                    "그룹 A": "#e3f2fd",
-                    "그룹 B": "#fff3e0",
-                    "그룹 C": "#fce4ec",
-                }
+            st.markdown(
+                f'<div style="display:flex;gap:12px;margin-bottom:12px;flex-wrap:wrap">'
+                f'{_pill(f"총 {total_h}h", "#f1f5f9", "#334155")}'
+                f'{_pill(f"공통 {common_hours}h", "#dbeafe", "#1e40af")}'
+                f'{_pill(f"그룹 실습 {group_hours}h", "#fef3c7", "#92400e")}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-                def _row_color(row):
-                    color = group_colors.get(row["구분"], "#ffffff")
-                    return [f"background-color: {color}"] * len(row)
+            if common:
+                st.markdown("#### 📖 공통 세션")
+                for i, s in enumerate(common):
+                    _render_session_card(s, expanded=(i == 0))
 
-                styled = df.style.apply(_row_color, axis=1)
-                st.dataframe(
-                    styled,
-                    hide_index=True,
-                    use_container_width=True,
-                    height=min(80 + len(df) * 80, 600),
-                    column_config={
-                        "구분":     st.column_config.TextColumn("구분",     width="small"),
-                        "세션명":   st.column_config.TextColumn("세션명",   width="medium"),
-                        "시간(h)":  st.column_config.NumberColumn("시간(h)", width="small", format="%.1f h"),
-                        "학습 목표": st.column_config.TextColumn("학습 목표", width="large"),
-                        "활동 내용": st.column_config.TextColumn("활동 내용", width="large"),
-                    },
-                )
+            if group_sessions:
+                st.markdown("#### 🧩 그룹별 병렬 세션")
+                st.caption("아래 그룹은 동일 시간대에 각자의 세션을 병렬 진행합니다.")
+                gcols = st.columns(len(group_sessions))
+                for col, gs in zip(gcols, group_sessions):
+                    g_name = gs.get("group_name", "")
+                    bg, tc = _GROUP_COLORS.get(g_name, ("#f1f5f9", "#334155"))
+                    g_hours = sum(s.get("duration_hours", 0) for s in gs.get("sessions", []))
+                    with col:
+                        st.markdown(
+                            f'<div style="background:{bg};color:{tc};padding:6px 12px;'
+                            f'border-radius:6px;font-weight:600;margin-bottom:8px">'
+                            f'{g_name}  ·  {g_hours}h</div>',
+                            unsafe_allow_html=True,
+                        )
+                        for s in gs.get("sessions", []):
+                            _render_session_card(s, expanded=False)
 
-    # ── 3. 예상 결과 & 참고 사항 표 ──────────────────────────────────
+    # ── 3. 예상 결과 & 참고 사항 ─────────────────────────────────────
     outcomes = plan.get("expected_outcomes", [])
     notes    = plan.get("notes", [])
     if outcomes or notes:
-        st.markdown("#### 📊 예상 결과 & 참고 사항")
+        st.markdown("### 📊 전체 기대효과 & 참고사항")
         r_col, n_col = st.columns(2)
         with r_col:
-            st.markdown("**🎯 예상 결과**")
-            if outcomes:
-                df_out = pd.DataFrame({"예상 결과": outcomes})
-                st.dataframe(df_out, hide_index=True, use_container_width=True)
+            st.markdown("**🎯 전체 기대효과**")
+            for o in outcomes:
+                st.success(o)
         with n_col:
             st.markdown("**📝 참고 사항**")
-            if notes:
-                df_notes = pd.DataFrame({"참고 사항": notes})
-                st.dataframe(df_notes, hide_index=True, use_container_width=True)
+            for n in notes:
+                st.warning(n)
 
 # ---------------------------------------------------------------------------
 # 커리큘럼 메인 렌더러
@@ -323,6 +393,15 @@ def render_curriculum() -> None:
         return
 
     st.divider()
+
+    # 내부 구조 검증 실패 시 경고 배너
+    if not st.session_state.get("curriculum_validated", True):
+        st.warning(
+            "**임시 결과** — 내부 구조 검증을 통과하지 못한 커리큘럼입니다. "
+            "수정 요청을 입력하면 재생성합니다.",
+            icon="⚠️",
+        )
+
     st.markdown(f"### 📋 {plan.get('program_title', '')}")
     st.caption(plan.get("target_summary", ""))
 
@@ -344,10 +423,10 @@ def render_curriculum() -> None:
     )
 
     # 뷰 전환 탭
-    tab_table, tab_json = st.tabs(["📊 표 형식", "📄 JSON"])
+    tab_cards, tab_json = st.tabs(["🃏 카드 형식", "📄 JSON"])
 
-    with tab_table:
-        render_curriculum_table(plan)
+    with tab_cards:
+        render_curriculum_cards(plan)
 
     with tab_json:
         st.caption("커리큘럼 전체 구조를 JSON으로 확인합니다.")
@@ -388,6 +467,7 @@ def handle_user_message(user_text: str) -> None:
 
     if result.get("curriculum"):
         st.session_state.curriculum_plan = result["curriculum"]
+        st.session_state.curriculum_validated = result.get("curriculum_validated", True)
 
 # ---------------------------------------------------------------------------
 # 로그인

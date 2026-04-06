@@ -10,12 +10,12 @@ if not logging.getLogger().handlers:
 
 logger = logging.getLogger("multi_agent.orchestrator")
 
-# 평가 기준 레이블
+# 평가 기준 레이블 (괄호: 검증 주체)
 _EVAL_LABELS = {
-    "time_constraint_ok": "시간 적합성",
-    "feasibility_ok":     "현실성",
-    "condition_fit_ok":   "조건 적합성",
-    "group_balance_ok":   "그룹 균형",
+    "time_constraint_ok": "시간 적합성 (코드 검증)",
+    "feasibility_ok":     "현실성 (LLM 평가)",
+    "condition_fit_ok":   "조건 적합성 (LLM 평가)",
+    "group_balance_ok":   "그룹 균형 (코드 검증)",
 }
 
 
@@ -192,6 +192,7 @@ def run_orchestrator(
         "curriculum": final_curriculum,
         "state": state.model_dump(),
         "active_agent": active_agent,
+        "curriculum_validated": state.phase == "complete" and final_curriculum is not None,
     }
 
 
@@ -231,9 +232,11 @@ def _run_generating_chain(state, messages, vectorstore, curriculum_mod, evaluato
         regen_count=state.regen_count,
     )
     curriculum = result.get("curriculum")
+    validated  = result.get("validated", False)
 
     state.agent_log.append(
         f"[커리큘럼 생성 에이전트{regen_label}] {'완료' if curriculum else '실패'}"
+        + (f" — 내부 검증 {'통과' if validated else '실패'}" if curriculum else "")
     )
 
     if not curriculum:
@@ -242,6 +245,11 @@ def _run_generating_chain(state, messages, vectorstore, curriculum_mod, evaluato
             + (result.get("reply") or "다시 시도해 주세요.")
         )
         return state, reply, None, "curriculum_agent"
+
+    # 내부 검증(validate_curriculum) 실패: 구조 오류 안내 후 complete 처리 스킵
+    if not validated:
+        logger.warning("[orchestrator] curriculum generated but internal validation failed")
+        state.agent_log.append("[오케스트레이터] 내부 구조 검증 실패 — 평가 에이전트에도 전달하여 판단 위임")
 
     # ------------------------------------------------------------------
     # 재생성인 경우: 이전 커리큘럼과 유사도 검사

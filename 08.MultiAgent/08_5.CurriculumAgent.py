@@ -1,178 +1,200 @@
-import json
+import importlib.util
 import logging
 import os
-from textwrap import dedent
+import sys
+from pathlib import Path
 
-from openai import OpenAI
 from langchain_chroma import Chroma
+from langchain_core.messages import HumanMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
 logger = logging.getLogger("multi_agent.curriculum_agent")
 
-# ---------------------------------------------------------------------------
-# 시스템 프롬프트
-# ---------------------------------------------------------------------------
-
-SYSTEM_PROMPT = dedent(
-    """
-    당신은 기업 AI 교육 커리큘럼을 생성하는 전문 에이전트다.
-    정보 수집 에이전트로부터 전달받은 요구사항을 바탕으로 커리큘럼을 설계한다.
-
-    ## 커리큘럼 생성 절차 (반드시 순서대로)
-    1. search_ax_compass("균형형 이해형 특성 강점 교육 접근법", ["균형형", "이해형"])
-    2. search_ax_compass("과신형 실행형 특성 강점 교육 접근법", ["과신형", "실행형"])
-    3. search_ax_compass("판단형 조심형 특성 강점 교육 접근법", ["판단형", "조심형"])
-    4. search_curriculum_examples(사용자 주제·수준·목표 기반 쿼리)
-    5. web_search("{주제} 기업 교육 커리큘럼 사례")
-    6. web_search("{주제} 최신 트렌드")
-    7. generate_curriculum (위 검색 완료 후에만 호출)
-
-    ## 주의사항
-    - 평가 에이전트의 개선 요청이 있으면 해당 내용을 generate_curriculum 호출 시 반드시 반영한다.
-    - generate_curriculum은 위 1~6번 검색을 모두 완료한 뒤에만 호출한다.
-    - 검색 결과를 그룹별·용도별로 분리해서 해당 파라미터에 전달한다.
-    """
-).strip()
-
-# ---------------------------------------------------------------------------
-# 도구 정의
-# ---------------------------------------------------------------------------
-
-def _fn(name: str, description: str, parameters: dict) -> dict:
-    return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
+PROMPT_PATH = Path(__file__).with_name("08_13.CurriculumAgentPrompt.txt")
 
 
-TOOLS = [
-    _fn(
-        "web_search",
-        "Tavily API로 외부 웹을 검색한다. 최신 AI 교육 트렌드 및 실제 커리큘럼 사례를 수집할 때 사용한다.",
-        {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "검색 쿼리"},
-            },
-            "required": ["query"],
-        },
-    ),
-    _fn(
-        "search_ax_compass",
-        "내부 VectorDB에서 AX Compass 유형별 특성, 강점, 보완 방향, 교육 접근법을 검색한다.",
-        {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "검색 쿼리"},
-                "type_names": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "필터링할 AX Compass 유형 목록 (예: ['균형형', '이해형'])",
-                },
-            },
-            "required": ["query"],
-        },
-    ),
-    _fn(
-        "search_curriculum_examples",
-        "내부 VectorDB에서 기업 AI 교육 커리큘럼 예시를 검색한다.",
-        {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "검색 쿼리 (주제, 수준, 목표 포함)"},
-            },
-            "required": ["query"],
-        },
-    ),
-    _fn(
-        "generate_curriculum",
-        dedent("""
-            수집된 정보와 검색한 참고 자료를 바탕으로 하루 단위 커리큘럼을 생성한다.
-            반드시 search_ax_compass × 3, search_curriculum_examples × 1, web_search × 2 완료 후 호출한다.
-        """).strip(),
-        {
-            "type": "object",
-            "properties": {
-                "company_name":        {"type": "string",  "description": "회사명 또는 팀 이름"},
-                "goal":                {"type": "string",  "description": "교육 목표"},
-                "audience":            {"type": "string",  "description": "교육 대상자"},
-                "level":               {"type": "string",  "description": "현재 AI 활용 수준"},
-                "days":                {"type": "integer", "description": "총 교육 기간 (일수)"},
-                "hours_per_day":       {"type": "integer", "description": "하루 교육 시간 (시간)"},
-                "topic":               {"type": "string",  "description": "원하는 핵심 주제"},
-                "constraints":         {"type": "string",  "description": "반영해야 할 조건 또는 제한사항"},
-                "count_balanced":      {"type": "integer", "description": "균형형 인원수"},
-                "count_learner":       {"type": "integer", "description": "이해형 인원수"},
-                "count_overconfident": {"type": "integer", "description": "과신형 인원수"},
-                "count_doer":          {"type": "integer", "description": "실행형 인원수"},
-                "count_analyst":       {"type": "integer", "description": "판단형 인원수"},
-                "count_cautious":      {"type": "integer", "description": "조심형 인원수"},
-                "ax_context_a": {"type": "string", "description": "그룹 A(균형형·이해형) AX Compass 검색 결과"},
-                "ax_context_b": {"type": "string", "description": "그룹 B(과신형·실행형) AX Compass 검색 결과"},
-                "ax_context_c": {"type": "string", "description": "그룹 C(판단형·조심형) AX Compass 검색 결과"},
-                "curriculum_context": {"type": "string", "description": "내부 커리큘럼 예시 검색 결과"},
-                "web_context": {"type": "string", "description": "웹 검색으로 수집한 사례 및 트렌드"},
-            },
-            "required": [
-                "company_name", "goal", "audience", "level",
-                "days", "hours_per_day", "topic", "constraints",
-                "count_balanced", "count_learner", "count_overconfident",
-                "count_doer", "count_analyst", "count_cautious",
-                "ax_context_a", "ax_context_b", "ax_context_c",
-                "curriculum_context", "web_context",
-            ],
-        },
-    ),
-]
+def _load_system_prompt() -> str:
+    return PROMPT_PATH.read_text(encoding="utf-8").strip()
 
-# ---------------------------------------------------------------------------
-# 도구 실행
-# ---------------------------------------------------------------------------
 
-def _execute_tool(name: str, tool_input: dict, vectorstore: Chroma) -> tuple[str, dict | None]:
-    import importlib.util, sys
+def _load_helpers():
     helpers_path = os.path.join(os.path.dirname(__file__), "08_3.AgentHelpers.py")
     if "agent_helpers_08" not in sys.modules:
         spec = importlib.util.spec_from_file_location("agent_helpers_08", helpers_path)
         mod = importlib.util.module_from_spec(spec)
         sys.modules["agent_helpers_08"] = mod
         spec.loader.exec_module(mod)
-    helpers = sys.modules["agent_helpers_08"]
+    return sys.modules["agent_helpers_08"]
 
-    if name == "web_search":
-        return helpers.web_search(tool_input["query"]), None
 
-    if name == "search_ax_compass":
-        type_names = tool_input.get("type_names") or None
-        return helpers.retrieve_ax_compass(vectorstore, tool_input["query"], type_names), None
+def _build_tools(
+    vectorstore: Chroma,
+    curriculum_holder: dict,
+    info_dict_holder: dict,
+) -> list:
+    helpers = _load_helpers()
 
-    if name == "search_curriculum_examples":
-        return helpers.retrieve_curriculum_examples(vectorstore, tool_input["query"]), None
+    @tool
+    def web_search(query: str) -> str:
+        """
+        Tavily API로 웹을 검색한다.
+        최신 AI 교육 트렌드, 기업 도입 사례, 실제 커리큘럼 구성 사례 등을 파악할 때 사용한다.
+        수집된 정보와 목적에 따라 필요한 횟수만큼 자율적으로 호출한다.
+        """
+        return helpers.web_search(query)
 
-    if name == "generate_curriculum":
-        ax_context_a       = tool_input.pop("ax_context_a", "")
-        ax_context_b       = tool_input.pop("ax_context_b", "")
-        ax_context_c       = tool_input.pop("ax_context_c", "")
-        curriculum_context = tool_input.pop("curriculum_context", "")
-        web_context        = tool_input.pop("web_context", "")
-        # evaluator_feedback는 에이전트가 시스템 프롬프트로 이미 알고 있으므로
-        # helpers.generate_curriculum에 별도 전달
-        evaluator_feedback = tool_input.pop("evaluator_feedback", "")
+    @tool
+    def search_ax_compass(query: str, type_names: list[str] | None = None) -> str:
+        """
+        내부 VectorDB에서 AX Compass 유형별 특성, 강점, 보완 방향, 교육 접근법을 검색한다.
+        type_names에 실제 인원이 있는 그룹의 유형만 지정한다. 인원이 0명인 그룹의 유형은 생략 가능하다.
+        예: 그룹 A(균형형·이해형)만 검색 시 type_names=["균형형", "이해형"]
+        """
+        return helpers.retrieve_ax_compass(vectorstore, query, type_names or None)
+
+    @tool
+    def search_curriculum_examples(query: str) -> str:
+        """
+        내부 VectorDB에서 기업 AI 교육 커리큘럼 예시를 검색한다.
+        사용자 요구사항과 유사한 기존 커리큘럼 사례를 확인할 때 사용한다.
+        """
+        return helpers.retrieve_curriculum_examples(vectorstore, query)
+
+    @tool
+    def generate_curriculum(
+        company_name: str,
+        goal: str,
+        audience: str,
+        level: str,
+        days: int,
+        hours_per_day: int,
+        topic: str,
+        constraints: str,
+        count_balanced: int,
+        count_learner: int,
+        count_overconfident: int,
+        count_doer: int,
+        count_analyst: int,
+        count_cautious: int,
+        ax_context_a: str,
+        ax_context_b: str,
+        ax_context_c: str,
+        curriculum_context: str,
+        web_context: str,
+    ) -> str:
+        """
+        수집한 정보와 검색 결과를 바탕으로 일차 단위 커리큘럼을 생성한다.
+        호출 전에 필요한 검색(search_ax_compass, search_curriculum_examples, web_search)을
+        자율적으로 판단하여 충분히 수행한 뒤 호출한다.
+        호출 후에는 반드시 validate_curriculum을 호출하여 결과를 검증해야 한다.
+
+        ax_context_a: 그룹 A(균형형·이해형) AX Compass 검색 결과 (인원 없으면 빈 문자열)
+        ax_context_b: 그룹 B(과신형·실행형) AX Compass 검색 결과 (인원 없으면 빈 문자열)
+        ax_context_c: 그룹 C(판단형·조심형) AX Compass 검색 결과 (인원 없으면 빈 문자열)
+        curriculum_context: 내부 커리큘럼 예시 검색 결과
+        web_context: 웹 검색으로 수집한 사례 및 최신 트렌드
+        """
+        MAX_REGEN = 3
+        current_count = curriculum_holder.get("regen_count", 0)
+        if current_count >= MAX_REGEN:
+            return (
+                f"[생성 차단] 이미 {current_count}회 생성하여 상한({MAX_REGEN}회)에 도달했습니다. "
+                "더 이상 generate_curriculum을 호출하지 마세요. "
+                "현재 저장된 결과와 검증 실패 사유를 사용자에게 안내하세요."
+            )
+
+        info_dict = {
+            "company_name": company_name,
+            "goal": goal,
+            "audience": audience,
+            "level": level,
+            "days": days,
+            "hours_per_day": hours_per_day,
+            "topic": topic,
+            "constraints": constraints,
+            "count_balanced": count_balanced,
+            "count_learner": count_learner,
+            "count_overconfident": count_overconfident,
+            "count_doer": count_doer,
+            "count_analyst": count_analyst,
+            "count_cautious": count_cautious,
+        }
         curriculum = helpers.generate_curriculum(
-            tool_input,
+            info_dict,
             ax_context_a=ax_context_a,
             ax_context_b=ax_context_b,
             ax_context_c=ax_context_c,
             curriculum_context=curriculum_context,
             web_context=web_context,
-            evaluator_feedback=evaluator_feedback,
         )
-        return "커리큘럼이 성공적으로 생성되었습니다.", curriculum
 
-    return f"알 수 없는 도구: {name}", None
+        regen_count = current_count + 1
+        curriculum_holder["result"] = curriculum
+        curriculum_holder["regen_count"] = regen_count
+        curriculum_holder["validated"] = False
+        curriculum_holder["validation_attempted"] = False
+        info_dict_holder["info"] = info_dict
 
-# ---------------------------------------------------------------------------
-# 에이전트 실행
-# ---------------------------------------------------------------------------
+        return (
+            f"커리큘럼이 생성되었습니다 (생성 {regen_count}/{MAX_REGEN}회차). "
+            "이제 validate_curriculum을 호출하여 구조 검증을 수행하세요."
+        )
+
+    @tool
+    def validate_curriculum() -> str:
+        """
+        가장 최근에 generate_curriculum으로 생성된 커리큘럼의 구조적 무결성을 검사한다.
+        generate_curriculum 호출 직후 반드시 이 도구를 호출해야 한다.
+
+        검사 항목:
+        - 시간 무결성: 각 일차의 common + group 합계 == hours_per_day
+        - 그룹 커버리지: 인원이 있는 그룹이 그룹 세션에 모두 포함되었는지
+        - 세션 타입 규칙: 공통 세션 ↔ '공통 이론'/'공통 실습', 그룹 세션 ↔ '그룹별 프로젝트'/'그룹별 심화 적용'
+        - 전체 구조: 일수 일치, program_title 존재
+        - 내용 충실도: goals/contents 3개 이상 (Warning만 표시, 재생성 불필요)
+
+        반환: "PASS" 또는 "FAIL: [문제 목록]"
+        FAIL이고 재생성 가능 횟수가 남아있으면 generate_curriculum을 재호출하여 수정한다.
+        재생성 횟수 상한(3회)에 도달하면 더 이상 재생성하지 말고 현재 결과와 문제점을 사용자에게 안내한다.
+        """
+        curriculum = curriculum_holder.get("result")
+        info = info_dict_holder.get("info")
+        if curriculum is None:
+            return "검증할 커리큘럼이 없습니다. generate_curriculum을 먼저 호출하세요."
+        if info is None:
+            return "info_dict가 없습니다. generate_curriculum을 먼저 호출하세요."
+
+        curriculum_holder["validation_attempted"] = True
+        result = helpers.validate_curriculum_result(curriculum, info)
+
+        if result.startswith("PASS"):
+            curriculum_holder["validated"] = True
+            return result
+
+        curriculum_holder["validated"] = False
+        regen_count = curriculum_holder.get("regen_count", 1)
+        max_regen = 3
+        remaining = max_regen - regen_count
+
+        if remaining <= 0:
+            return (
+                result
+                + "\n\n[재생성 횟수 상한 도달: 추가 재생성 금지]"
+                " 현재 결과를 전달하고 위 문제점을 함께 안내하세요."
+            )
+        return (
+            result
+            + f"\n\n[현재 생성 {regen_count}회차 / 상한 {max_regen}회 | 재생성 가능 {remaining}회 남음]"
+            " constraints 파라미터에 위 문제 항목을 명시하고 generate_curriculum을 재호출하세요."
+        )
+
+    return [web_search, search_ax_compass, search_curriculum_examples, generate_curriculum, validate_curriculum]
+
 
 def run_curriculum_agent(
     collected_info: dict,
@@ -180,7 +202,7 @@ def run_curriculum_agent(
     *,
     evaluator_feedback: str = "",
     regen_count: int = 0,
-    max_iterations: int = 20,
+    max_iterations: int = 25,
 ) -> dict:
     """
     수집된 정보를 받아 RAG 검색 후 커리큘럼을 생성한다.
@@ -194,9 +216,9 @@ def run_curriculum_agent(
     evaluator_feedback : str
         EvaluatorAgent가 요청한 개선사항 (재생성 시에만 전달)
     regen_count : int
-        재생성 횟수 (로깅 용도)
+        현재 재생성 횟수 (오케스트레이터가 관리)
     max_iterations : int
-        무한 루프 방지용 최대 반복 횟수
+        recursion_limit = max_iterations * 3 (자기 검증 루프 포함)
 
     Returns
     -------
@@ -204,20 +226,22 @@ def run_curriculum_agent(
         {
             "reply": str,
             "curriculum": dict | None,
+            "validated": bool,
         }
     """
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    curriculum_holder: dict = {}
+    info_dict_holder: dict = {}
 
-    system_content = SYSTEM_PROMPT
+    system_prompt = _load_system_prompt()
+
     if evaluator_feedback:
-        system_content += (
+        system_prompt += (
             f"\n\n## 평가 에이전트의 개선 요청 (재생성 #{regen_count})\n"
             f"{evaluator_feedback}\n"
             "위 개선 요청을 generate_curriculum 호출 시 반드시 반영해야 한다."
         )
 
-    # 에이전트에게 수집된 정보를 컨텍스트로 제공
+    import json
     user_message = (
         f"아래 정보를 바탕으로 커리큘럼을 생성해 주세요.\n\n"
         f"```json\n{json.dumps(collected_info, ensure_ascii=False, indent=2)}\n```"
@@ -225,54 +249,49 @@ def run_curriculum_agent(
     if evaluator_feedback:
         user_message += f"\n\n평가 에이전트의 피드백:\n{evaluator_feedback}"
 
-    api_messages: list[dict] = [
-        {"role": "system", "content": system_content},
-        {"role": "user",   "content": user_message},
-    ]
+    model = ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+    tools = _build_tools(vectorstore, curriculum_holder, info_dict_holder)
+    graph = create_react_agent(model, tools, prompt=system_prompt)
 
-    curriculum: dict | None = None
+    logger.info("[curriculum_agent] invoke start regen=%s", regen_count)
 
-    for iteration in range(max_iterations):
-        logger.info("[curriculum_agent] iteration=%s regen=%s", iteration, regen_count)
-
-        response = client.chat.completions.create(
-            model=model,
-            messages=api_messages,
-            tools=TOOLS,
-            tool_choice="auto",
+    try:
+        result = graph.invoke(
+            {"messages": [HumanMessage(content=user_message)]},
+            config={"recursion_limit": max_iterations * 3},
         )
-        choice = response.choices[0]
-        message = choice.message
+        last = result["messages"][-1]
+        reply = last.content if isinstance(last.content, str) else str(last.content)
 
-        if choice.finish_reason == "stop":
-            return {
-                "reply": message.content or "",
-                "curriculum": curriculum,
-            }
+        # 에이전트가 validate_curriculum을 호출하지 않은 경우 강제 실행
+        if "result" in curriculum_holder and not curriculum_holder.get("validation_attempted"):
+            info = info_dict_holder.get("info")
+            if info:
+                helpers = _load_helpers()
+                logger.warning("[curriculum_agent] validate_curriculum 미호출 감지 — 강제 검증 실행")
+                forced = helpers.validate_curriculum_result(curriculum_holder["result"], info)
+                curriculum_holder["validation_attempted"] = True
+                curriculum_holder["validated"] = forced.startswith("PASS")
+                logger.info("[curriculum_agent] 강제 검증 결과: %s", forced[:120])
 
-        if choice.finish_reason == "tool_calls":
-            api_messages.append(message)
-
-            for tc in message.tool_calls:
-                tool_args = json.loads(tc.function.arguments)
-                logger.info("[curriculum_agent] tool=%s", tc.function.name)
-
-                result_text, maybe_curriculum = _execute_tool(tc.function.name, tool_args, vectorstore)
-                if maybe_curriculum is not None:
-                    curriculum = maybe_curriculum
-
-                api_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_text,
-                })
-            continue
-
-        logger.warning("[curriculum_agent] unexpected finish_reason=%s", choice.finish_reason)
-        break
-
-    logger.error("[curriculum_agent] max_iterations exceeded")
-    return {
-        "reply": "커리큘럼 생성 중 문제가 발생했습니다. 다시 시도해 주세요.",
-        "curriculum": curriculum,
-    }
+        is_validated = curriculum_holder.get("validated", False)
+        logger.info(
+            "[curriculum_agent] invoke done curriculum=%s validated=%s regen=%s",
+            "result" in curriculum_holder, is_validated, curriculum_holder.get("regen_count", 0),
+        )
+        return {
+            "reply": reply,
+            "curriculum": curriculum_holder.get("result"),
+            "validated": is_validated,
+        }
+    except Exception as err:
+        logger.error("[curriculum_agent] error: %s", err)
+        return {
+            "reply": "커리큘럼 생성 중 문제가 발생했습니다. 다시 시도해 주세요.",
+            "curriculum": curriculum_holder.get("result"),
+            "validated": False,
+        }

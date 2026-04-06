@@ -1,6 +1,9 @@
+import importlib.util
 import json
 import logging
 import os
+import sys
+from pathlib import Path
 from textwrap import dedent
 
 from langchain_openai import ChatOpenAI
@@ -12,54 +15,10 @@ if not logging.getLogger().handlers:
 logger = logging.getLogger("multi_agent.evaluator")
 
 # ---------------------------------------------------------------------------
-# 시스템 프롬프트
+# 스키마 / 헬퍼 로드
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = dedent(
-    """
-    당신은 기업 AI 교육 커리큘럼의 품질을 평가하는 전문 에이전트다.
-    커리큘럼 생성 에이전트가 만든 결과물을 아래 4가지 기준으로 엄격하게 평가한다.
-
-    ## 평가 기준
-
-    ### 1. 시간 적합성 (time_constraint_ok)
-    - 각 일차(DaySchedule)에서 common_sessions 합계 + 그룹 sessions 합계(한 그룹 기준) = hours_per_day 를 만족하는지 확인
-    - 세 그룹의 sessions 시간 합계가 동일한지 확인
-    - 허용 오차: ±0.5시간
-    - 실패 기준: 어느 한 일차라도 시간이 맞지 않으면 false
-
-    ### 2. 현실성 (feasibility_ok)
-    - 각 세션의 title과 activities가 실제 기업 교육에서 진행 가능한 내용인지 확인
-    - 세션당 duration_hours에 비해 activities가 너무 많거나 너무 적지 않은지 확인
-    - 실패 기준: 추상적이거나 실행 불가능한 세션이 전체의 30% 이상이면 false
-
-    ### 3. 조건 적합성 (condition_fit_ok)
-    - 기업의 교육 목표(goal)와 핵심 주제(topic)가 커리큘럼에 명확히 반영됐는지 확인
-    - 제약 사항(constraints)이 실제로 반영됐는지 확인
-    - 교육 대상자(audience)와 AI 활용 수준(level)에 맞는 난이도인지 확인
-    - 실패 기준: 목표·주제·제약 중 하나라도 반영되지 않으면 false
-
-    ### 4. 그룹 균형 (group_balance_ok)
-    - 3개 그룹(A/B/C) 각각에 대한 세션이 모든 일차에 존재하는지 확인
-    - 그룹별 세션 내용이 해당 AX Compass 유형에 맞게 차별화됐는지 확인
-    - 실패 기준: 한 그룹이라도 세션이 없는 일차가 있으면 false
-
-    ## 출력 규칙
-    - passed: 4가지 기준을 모두 통과해야 true
-    - feedback: 통과하지 못한 기준만 구체적으로 작성. 커리큘럼 에이전트가 재생성 시 반영할 수 있도록
-      반드시 "X일차 common_sessions 합계 Ah + 그룹 sessions 합계 Bh = (A+B)h 인데 hours_per_day는 Ch입니다. 조정 필요."
-      형식으로 common과 group을 모두 합산한 값과 hours_per_day를 비교해 서술한다.
-      common만 단독으로 hours_per_day와 비교하는 것은 오류다.
-    - summary: 사용자에게 보여줄 평가 결과 요약 (통과 시 "평가를 통과했습니다.", 미통과 시 주요 문제 1~2개 언급)
-    """
-).strip()
-
-# ---------------------------------------------------------------------------
-# EvaluationResult 스키마 로드
-# ---------------------------------------------------------------------------
-
-def _load_evaluation_result_class():
-    import importlib.util, sys
+def _load_schemas():
     schemas_path = os.path.join(os.path.dirname(__file__), "08_2.AgentSchemas.py")
     key = "agent_schemas_08_eval"
     if key not in sys.modules:
@@ -67,7 +26,44 @@ def _load_evaluation_result_class():
         mod = importlib.util.module_from_spec(spec)
         sys.modules[key] = mod
         spec.loader.exec_module(mod)
-    return sys.modules[key].EvaluationResult
+    return sys.modules[key]
+
+
+def _load_helpers():
+    helpers_path = os.path.join(os.path.dirname(__file__), "08_3.AgentHelpers.py")
+    key = "agent_helpers_08"
+    if key not in sys.modules:
+        spec = importlib.util.spec_from_file_location(key, helpers_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[key] = mod
+        spec.loader.exec_module(mod)
+    return sys.modules[key]
+
+# ---------------------------------------------------------------------------
+# 시스템 프롬프트 — 정성 평가(feasibility, condition_fit)만 담당
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT = Path(__file__).with_name("08_14.EvaluatorAgentPrompt.txt").read_text(encoding="utf-8").strip()
+
+
+def _fetch_reference_cases(helpers, topic: str, audience: str, level: str) -> str:
+    """
+    평가 기준이 될 실제 운영 커리큘럼 사례를 웹에서 검색한다.
+    검색 실패 시 빈 문자열을 반환한다 (평가 흐름에는 영향 없음).
+    """
+    queries = [
+        f"{topic} 기업 AI 교육 커리큘럼 실제 사례 {level}",
+        f"{audience} 대상 {topic} 교육과정 운영 사례",
+    ]
+    parts: list[str] = []
+    for q in queries:
+        try:
+            result = helpers.web_search(q, max_results=3)
+            if result and "오류" not in result:
+                parts.append(result)
+        except Exception as err:
+            logger.warning("[evaluator] web_search failed for '%s': %s", q, err)
+    return "\n\n---\n\n".join(parts) if parts else ""
 
 # ---------------------------------------------------------------------------
 # 에이전트 실행
@@ -75,7 +71,10 @@ def _load_evaluation_result_class():
 
 def run_evaluator(curriculum: dict, collected_info: dict) -> dict:
     """
-    생성된 커리큘럼을 4가지 기준으로 평가한다.
+    생성된 커리큘럼을 평가한다.
+
+    구조/산술 항목(time_constraint_ok, group_balance_ok)은 코드로 먼저 계산하고,
+    정성 항목(feasibility_ok, condition_fit_ok)만 LLM에 위임한다.
 
     Parameters
     ----------
@@ -89,32 +88,67 @@ def run_evaluator(curriculum: dict, collected_info: dict) -> dict:
     dict
         {
             "passed": bool,
-            "feedback": str,   # 커리큘럼 에이전트에게 전달할 개선 요청
-            "reply": str,      # 사용자에게 보여줄 평가 요약
-            "evaluation": dict,  # EvaluationResult 전체
+            "feedback": str,
+            "reply": str,
+            "evaluation": dict,
         }
     """
-    EvaluationResult = _load_evaluation_result_class()
+    schemas = _load_schemas()
+    helpers = _load_helpers()
 
-    days = collected_info.get("days", 1)
+    # ── 1. 코드 기반 구조 검증 ────────────────────────────────────────
+    struct = helpers.evaluate_structure(curriculum, collected_info)
+    time_constraint_ok = struct["time_constraint_ok"]
+    group_balance_ok   = struct["group_balance_ok"]
+    time_issues        = struct["time_issues"]
+    group_issues       = struct["group_issues"]
+    time_summary       = struct["time_summary"]
+    active_groups      = struct["active_groups"]
+
+    logger.info(
+        "[evaluator] code check — time_ok=%s group_ok=%s time_issues=%s group_issues=%s",
+        time_constraint_ok, group_balance_ok, len(time_issues), len(group_issues),
+    )
+
+    days          = collected_info.get("days", 1)
     hours_per_day = collected_info.get("hours_per_day", 8)
+    topic         = collected_info.get("topic", "")
+    audience      = collected_info.get("audience", "")
+    level         = collected_info.get("level", "")
+
+    # ── 2. 실제 운영 커리큘럼 사례 웹 검색 ──────────────────────────────
+    logger.info("[evaluator] fetching reference cases for feasibility check")
+    reference_cases = _fetch_reference_cases(helpers, topic, audience, level)
+    if reference_cases:
+        logger.info("[evaluator] reference cases fetched (%d chars)", len(reference_cases))
+    else:
+        logger.warning("[evaluator] no reference cases found, feasibility check proceeds without external data")
+
+    # ── 3. LLM 정성 평가 ─────────────────────────────────────────────
+    reference_section = (
+        f"[실제 운영 커리큘럼 사례 — feasibility 판단 시 비교 기준으로 활용]\n{reference_cases}"
+        if reference_cases
+        else "[실제 사례 검색 결과 없음 — 일반적인 기업 교육 기준으로 판단]"
+    )
 
     prompt = dedent(
         f"""
-        아래 커리큘럼을 평가 기준에 따라 평가해 주세요.
+        아래 커리큘럼의 강의 실행 가능성(feasibility_ok)과 요구사항 반영 여부(condition_fit_ok)를 평가해 주세요.
 
         [요구사항]
         회사명: {collected_info.get('company_name', '')}
         교육 목표: {collected_info.get('goal', '')}
-        교육 대상: {collected_info.get('audience', '')}
-        AI 활용 수준: {collected_info.get('level', '')}
-        교육 기간: {days}일
-        하루 교육 시간: {hours_per_day}시간
-        핵심 주제: {collected_info.get('topic', '')}
+        교육 대상: {audience}
+        AI 활용 수준: {level}
+        교육 기간: {days}일 / 하루 {hours_per_day}시간
+        핵심 주제: {topic}
         제약 사항: {collected_info.get('constraints', '')}
-        그룹 인원: 균형형 {collected_info.get('count_balanced', 0)}명 / 이해형 {collected_info.get('count_learner', 0)}명 /
-                  과신형 {collected_info.get('count_overconfident', 0)}명 / 실행형 {collected_info.get('count_doer', 0)}명 /
-                  판단형 {collected_info.get('count_analyst', 0)}명 / 조심형 {collected_info.get('count_cautious', 0)}명
+        실제 인원이 있는 그룹: {', '.join(active_groups) if active_groups else '없음'}
+
+        [시간 합계 검증 결과 — 코드로 계산 완료, 재평가 불필요]
+        {time_summary}
+
+        {reference_section}
 
         [생성된 커리큘럼]
         ```json
@@ -130,26 +164,84 @@ def run_evaluator(curriculum: dict, collected_info: dict) -> dict:
     )
 
     try:
-        result: EvaluationResult = llm.with_structured_output(EvaluationResult).invoke(
-            [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-        )
+        llm_result: schemas.LLMEvaluationResult = llm.with_structured_output(
+            schemas.LLMEvaluationResult
+        ).invoke([SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)])
+
+        feasibility_score = llm_result.feasibility_score  # -1이면 사례 비교 모드
+        condition_fit_ok  = llm_result.condition_fit_ok
+        summary           = llm_result.summary
+
+        # 사례 없는 경우: 점수 기반으로 feasibility_ok 재판정
+        if not reference_cases and feasibility_score >= 0:
+            feasibility_ok = feasibility_score >= 7
+            logger.info(
+                "[evaluator] no reference cases — score-based feasibility: score=%s ok=%s",
+                feasibility_score, feasibility_ok,
+            )
+        else:
+            feasibility_ok = llm_result.feasibility_ok
+
+        # ── 3. 피드백 조립 — 실패 항목만, 확인된 근거만 ───────────────
+        feedback_parts: list[str] = []
+        if not time_constraint_ok:
+            feedback_parts.append("## 시간 조정 필요\n" + "\n".join(f"- {i}" for i in time_issues))
+        if not group_balance_ok:
+            feedback_parts.append("## 그룹 세션 누락 수정 필요\n" + "\n".join(f"- {i}" for i in group_issues))
+        if not feasibility_ok and llm_result.feasibility_feedback:
+            feedback_parts.append("## 세션 실행 가능성 개선 필요\n" + llm_result.feasibility_feedback)
+        if not condition_fit_ok and llm_result.condition_feedback:
+            feedback_parts.append("## 요구사항 반영 보완 필요\n" + llm_result.condition_feedback)
+
+        feedback = "\n\n".join(feedback_parts)
+
+        # ── 4. 최종 passed 판정 ───────────────────────────────────────
+        passed = time_constraint_ok and group_balance_ok and feasibility_ok and condition_fit_ok
+
+        evaluation = {
+            "time_constraint_ok": time_constraint_ok,
+            "feasibility_ok":     feasibility_ok,
+            "feasibility_score":  feasibility_score,  # -1: 사례 비교, 0~10: 자체 점수
+            "condition_fit_ok":   condition_fit_ok,
+            "group_balance_ok":   group_balance_ok,
+            "passed":             passed,
+            "feedback":           feedback,
+            "summary":            summary,
+        }
+
         logger.info(
             "[evaluator] passed=%s time=%s feasibility=%s condition=%s balance=%s",
-            result.passed, result.time_constraint_ok, result.feasibility_ok,
-            result.condition_fit_ok, result.group_balance_ok,
+            passed, time_constraint_ok, feasibility_ok, condition_fit_ok, group_balance_ok,
         )
         return {
-            "passed": result.passed,
-            "feedback": result.feedback,
-            "reply": result.summary,
-            "evaluation": result.model_dump(),
+            "passed":     passed,
+            "feedback":   feedback,
+            "reply":      summary,
+            "evaluation": evaluation,
         }
+
     except Exception as err:
-        logger.error("[evaluator] evaluation failed: %s", err)
-        # 평가 실패 시 통과로 처리해 무한 루프 방지
+        logger.error("[evaluator] LLM evaluation failed: %s", err)
+        # LLM 실패 시 코드 검증 결과만으로 판정
+        feedback_parts = []
+        if not time_constraint_ok:
+            feedback_parts.append("## 시간 조정 필요\n" + "\n".join(f"- {i}" for i in time_issues))
+        if not group_balance_ok:
+            feedback_parts.append("## 그룹 세션 누락 수정 필요\n" + "\n".join(f"- {i}" for i in group_issues))
+
+        passed   = time_constraint_ok and group_balance_ok
+        feedback = "\n\n".join(feedback_parts)
+        summary  = "평가 중 오류가 발생해 구조 검증 결과만 반영합니다." if not passed else "구조 검증을 통과했습니다."
+
         return {
-            "passed": True,
-            "feedback": "",
-            "reply": "평가 중 오류가 발생해 커리큘럼을 그대로 사용합니다.",
-            "evaluation": {},
+            "passed":     passed,
+            "feedback":   feedback,
+            "reply":      summary,
+            "evaluation": {
+                "time_constraint_ok": time_constraint_ok,
+                "feasibility_ok":     True,
+                "condition_fit_ok":   True,
+                "group_balance_ok":   group_balance_ok,
+                "passed":             passed,
+            },
         }

@@ -1,46 +1,27 @@
 import json
 import logging
 import os
+from pathlib import Path
 from textwrap import dedent
 
-from openai import OpenAI
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.prebuilt import create_react_agent
 
 if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s - %(message)s")
 
 logger = logging.getLogger("multi_agent.info_collector")
 
-# ---------------------------------------------------------------------------
-# 시스템 프롬프트
-# ---------------------------------------------------------------------------
+PROMPT_PATH = Path(__file__).with_name("08_12.InfoCollectorPrompt.txt")
 
-SYSTEM_PROMPT = dedent(
-    """
-    당신은 기업 AI 교육 커리큘럼 설계를 위한 정보 수집 전담 에이전트다.
-    사용자와 친절하고 자연스럽게 대화하며 아래 9가지 정보를 빠짐없이 수집한다.
 
-    ## 수집해야 할 정보
-    1. 회사명 또는 팀 이름
-    2. 교육 목표
-    3. 교육 대상자
-    4. 현재 AI 활용 수준 (입문 / 초급 / 중급)
-    5. 총 교육 기간 (일수)
-    6. 하루 교육 시간 (시간)
-    7. 다루고 싶은 핵심 주제
-    8. 반영해야 할 조건 또는 제한사항 (없으면 "없음"으로 처리)
-    9. AX Compass 진단 결과 — 6개 유형별 인원수
-       균형형 / 이해형 / 과신형 / 실행형 / 판단형 / 조심형
-       (0명인 유형도 반드시 확인해야 함)
+def _load_system_prompt() -> str:
+    return PROMPT_PATH.read_text(encoding="utf-8").strip()
 
-    ## 행동 지침
-    - 사용자가 여러 정보를 한 번에 말하면 이미 확인된 항목은 다시 묻지 않는다.
-    - 아직 수집되지 않은 정보를 자연스럽게 이어서 질문한다.
-    - AX Compass 인원은 6개 유형 모두 확인되어야 한다 (0명도 명시).
-    - 모든 정보가 수집되면 사용자에게 수집된 내용을 간략히 요약해 확인을 받은 뒤
-      즉시 submit_info 도구를 호출한다.
-    - 커리큘럼 생성은 이 에이전트의 역할이 아니다. 정보 수집에만 집중한다.
-    """
-).strip()
+
+BASE_SYSTEM_PROMPT = _load_system_prompt()
 
 # 유사 커리큘럼 감지 시 추가되는 시스템 프롬프트 섹션
 _SIMILARITY_MODE_PROMPT = dedent(
@@ -71,51 +52,50 @@ _SIMILARITY_MODE_PROMPT = dedent(
     """
 ).strip()
 
-# ---------------------------------------------------------------------------
-# 도구 정의
-# ---------------------------------------------------------------------------
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "submit_info",
-            "description": (
-                "9가지 정보가 모두 수집되고 사용자 확인까지 완료됐을 때 호출한다. "
-                "수집된 정보를 구조화해서 커리큘럼 생성 에이전트에게 넘긴다."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "company_name":        {"type": "string",  "description": "회사명 또는 팀 이름"},
-                    "goal":                {"type": "string",  "description": "교육 목표"},
-                    "audience":            {"type": "string",  "description": "교육 대상자"},
-                    "level":               {"type": "string",  "description": "현재 AI 활용 수준"},
-                    "days":                {"type": "integer", "description": "총 교육 기간 (일수)"},
-                    "hours_per_day":       {"type": "integer", "description": "하루 교육 시간 (시간)"},
-                    "topic":               {"type": "string",  "description": "원하는 핵심 주제"},
-                    "constraints":         {"type": "string",  "description": "반영해야 할 조건 또는 제한사항"},
-                    "count_balanced":      {"type": "integer", "description": "균형형 인원수"},
-                    "count_learner":       {"type": "integer", "description": "이해형 인원수"},
-                    "count_overconfident": {"type": "integer", "description": "과신형 인원수"},
-                    "count_doer":          {"type": "integer", "description": "실행형 인원수"},
-                    "count_analyst":       {"type": "integer", "description": "판단형 인원수"},
-                    "count_cautious":      {"type": "integer", "description": "조심형 인원수"},
-                },
-                "required": [
-                    "company_name", "goal", "audience", "level",
-                    "days", "hours_per_day", "topic", "constraints",
-                    "count_balanced", "count_learner", "count_overconfident",
-                    "count_doer", "count_analyst", "count_cautious",
-                ],
-            },
-        },
-    }
-]
+def _build_tools(collected_info_holder: dict) -> list:
+    @tool
+    def submit_info(
+        company_name: str,
+        goal: str,
+        audience: str,
+        level: str,
+        days: int,
+        hours_per_day: int,
+        topic: str,
+        constraints: str,
+        count_balanced: int,
+        count_learner: int,
+        count_overconfident: int,
+        count_doer: int,
+        count_analyst: int,
+        count_cautious: int,
+    ) -> str:
+        """
+        9가지 정보가 모두 수집되고 사용자 확인까지 완료됐을 때 호출한다.
+        수집된 정보를 구조화해서 커리큘럼 생성 에이전트에게 넘긴다.
+        """
+        collected_info_holder["result"] = {
+            "company_name": company_name,
+            "goal": goal,
+            "audience": audience,
+            "level": level,
+            "days": days,
+            "hours_per_day": hours_per_day,
+            "topic": topic,
+            "constraints": constraints,
+            "count_balanced": count_balanced,
+            "count_learner": count_learner,
+            "count_overconfident": count_overconfident,
+            "count_doer": count_doer,
+            "count_analyst": count_analyst,
+            "count_cautious": count_cautious,
+        }
+        logger.info("[info_collector] submit_info called: %s", list(collected_info_holder["result"].keys()))
+        return "정보가 성공적으로 제출되었습니다. 커리큘럼 생성 에이전트에게 전달합니다."
 
-# ---------------------------------------------------------------------------
-# 에이전트 실행
-# ---------------------------------------------------------------------------
+    return [submit_info]
+
 
 def run_info_collector(
     messages: list[dict],
@@ -134,10 +114,9 @@ def run_info_collector(
     existing_info : dict | None
         이미 수집된 정보 (부분 수집 재시작 시 전달)
     similarity_context : str
-        유사 커리큘럼 감지 시 오케스트레이터가 전달하는 컨텍스트.
-        비어 있지 않으면 추가 정보 수집 모드로 동작한다.
+        유사 커리큘럼 감지 시 오케스트레이터가 전달하는 컨텍스트
     max_iterations : int
-        무한 루프 방지용 최대 반복 횟수
+        recursion_limit = max_iterations * 2
 
     Returns
     -------
@@ -148,12 +127,10 @@ def run_info_collector(
             "complete": bool,
         }
     """
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    collected_info_holder: dict = {}
 
-    system_content = SYSTEM_PROMPT
+    system_content = BASE_SYSTEM_PROMPT
 
-    # 유사 커리큘럼 감지 시: 추가 정보 수집 모드 프롬프트 삽입
     if similarity_context:
         system_content += "\n\n" + _SIMILARITY_MODE_PROMPT.format(
             similarity_context=similarity_context
@@ -167,64 +144,47 @@ def run_info_collector(
             "위 항목은 이미 확인된 정보이므로 변경 요청이 없는 한 그대로 유지한다."
         )
 
-    api_messages: list[dict] = [{"role": "system", "content": system_content}]
-    api_messages += messages
+    model = ChatOpenAI(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        temperature=0,
+        api_key=os.getenv("OPENAI_API_KEY"),
+    )
+    tools = _build_tools(collected_info_holder)
+    graph = create_react_agent(model, tools, prompt=system_content)
 
-    for iteration in range(max_iterations):
-        logger.info("[info_collector] iteration=%s messages=%s", iteration, len(api_messages))
+    lc_messages = [
+        HumanMessage(content=m["content"]) if m["role"] == "user" else AIMessage(content=m["content"])
+        for m in messages
+    ]
 
-        response = client.chat.completions.create(
-            model=model,
-            messages=api_messages,
-            tools=TOOLS,
-            tool_choice="auto",
+    logger.info("[info_collector] invoke start messages=%s", len(lc_messages))
+
+    try:
+        result = graph.invoke(
+            {"messages": lc_messages},
+            config={"recursion_limit": max_iterations * 2},
         )
-        choice = response.choices[0]
-        message = choice.message
+        last = result["messages"][-1]
+        reply = last.content if isinstance(last.content, str) else str(last.content)
 
-        if choice.finish_reason == "stop":
+        if "result" in collected_info_holder:
+            logger.info("[info_collector] complete=True")
             return {
-                "reply": message.content or "",
-                "collected_info": None,
-                "complete": False,
+                "reply": reply,
+                "collected_info": collected_info_holder["result"],
+                "complete": True,
             }
 
-        if choice.finish_reason == "tool_calls":
-            api_messages.append(message)
-            collected_info = None
-
-            for tc in message.tool_calls:
-                if tc.function.name == "submit_info":
-                    collected_info = json.loads(tc.function.arguments)
-                    logger.info("[info_collector] submit_info called: %s", list(collected_info.keys()))
-                    api_messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": "정보가 성공적으로 제출되었습니다. 커리큘럼 생성 에이전트에게 전달합니다.",
-                    })
-
-            if collected_info is not None:
-                # 제출 후 사용자에게 보낼 마지막 메시지를 생성
-                final_response = client.chat.completions.create(
-                    model=model,
-                    messages=api_messages,
-                    tools=TOOLS,
-                    tool_choice="none",
-                )
-                reply = final_response.choices[0].message.content or ""
-                return {
-                    "reply": reply,
-                    "collected_info": collected_info,
-                    "complete": True,
-                }
-            continue
-
-        logger.warning("[info_collector] unexpected finish_reason=%s", choice.finish_reason)
-        break
-
-    logger.error("[info_collector] max_iterations exceeded")
-    return {
-        "reply": "정보 수집 중 문제가 발생했습니다. 다시 시도해 주세요.",
-        "collected_info": None,
-        "complete": False,
-    }
+        logger.info("[info_collector] complete=False")
+        return {
+            "reply": reply,
+            "collected_info": None,
+            "complete": False,
+        }
+    except Exception as err:
+        logger.error("[info_collector] error: %s", err)
+        return {
+            "reply": "정보 수집 중 문제가 발생했습니다. 다시 시도해 주세요.",
+            "collected_info": None,
+            "complete": False,
+        }

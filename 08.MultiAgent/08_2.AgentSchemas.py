@@ -35,6 +35,7 @@ class ChatResponse(BaseModel):
     curriculum: dict | None = None
     state: OrchestratorState
     active_agent: str  # "info_collector" | "curriculum_agent" | "evaluator" | "complete"
+    curriculum_validated: bool = True  # 내부 구조 검증 통과 여부
 
 
 # 커리큘럼 구성 단위
@@ -93,14 +94,52 @@ class CollectedInfo(BaseModel):
 
 
 # 평가 에이전트가 반환하는 구조화된 평가 결과
+# time_constraint_ok, group_balance_ok는 코드로 계산 후 주입 (LLM 미평가)
+# feasibility_ok, condition_fit_ok만 LLM이 판단
+class LLMEvaluationResult(BaseModel):
+    feasibility_ok: bool = Field(
+        description="세션 내용이 실제로 강의 가능한 수준인지. "
+                    "실제 사례가 제공된 경우: 사례 대비 현저히 과도하거나 추상적인 세션이 30% 이상이면 false. "
+                    "실제 사례가 없는 경우: feasibility_score >= 7이면 true, 미만이면 false로 설정한다."
+    )
+    feasibility_score: int = Field(
+        description="실제 사례 없이 자체 판단하는 경우에만 사용하는 0~10점 구현 가능성 점수. "
+                    "실제 사례가 제공된 경우에는 -1로 설정한다. "
+                    "채점 기준: "
+                    "10 = 모든 세션이 실제 기업 교육에서 즉시 실행 가능. "
+                    "7~9 = 대부분 실행 가능하며 일부 조정이 필요한 수준. "
+                    "4~6 = 절반 이상의 세션이 수정 없이는 실행하기 어려움. "
+                    "0~3 = 대부분의 세션이 추상적이거나 실행 불가능한 수준."
+    )
+    condition_fit_ok: bool = Field(
+        description="교육 목표·핵심 주제·제약사항·대상자 수준이 커리큘럼에 실질적으로 반영됐는지. "
+                    "하나라도 반영되지 않으면 false."
+    )
+    feasibility_feedback: str = Field(
+        description="feasibility_ok가 false일 때만 작성. "
+                    "실행 불가능한 세션명과 구체적인 이유, 또는 점수 기반 판단 근거를 나열한다. "
+                    "true이면 반드시 빈 문자열로 둔다."
+    )
+    condition_feedback: str = Field(
+        description="condition_fit_ok가 false일 때만 작성. "
+                    "반영되지 않은 요구사항을 구체적으로 나열한다. "
+                    "true이면 반드시 빈 문자열로 둔다."
+    )
+    summary: str = Field(
+        description="사용자에게 보여줄 평가 요약 1~2문장. "
+                    "통과 시 '평가를 통과했습니다.', 미통과 시 핵심 문제 1~2개만 언급한다. "
+                    "점수 기반 판단 시 점수를 요약에 포함한다 (예: '구현 가능성 점수 6/10으로 미통과')."
+    )
+
+
 class EvaluationResult(BaseModel):
     passed: bool = Field(description="전체 평가 통과 여부")
-    time_constraint_ok: bool = Field(description="하루 시간 합계가 hours_per_day와 일치하는지")
-    feasibility_ok: bool = Field(description="세션 내용이 실제로 강의 가능한 수준인지")
-    condition_fit_ok: bool = Field(description="기업 요구사항과 제약사항이 반영됐는지")
-    group_balance_ok: bool = Field(description="3개 그룹의 세션 시간과 내용이 균형 잡혔는지")
+    time_constraint_ok: bool = Field(description="코드 계산 기반 시간 합계 검증 결과")
+    feasibility_ok: bool = Field(description="LLM 평가: 세션 내용이 실제로 강의 가능한 수준인지")
+    condition_fit_ok: bool = Field(description="LLM 평가: 기업 요구사항과 제약사항이 반영됐는지")
+    group_balance_ok: bool = Field(description="코드 계산 기반 그룹 커버리지 검증 결과")
     feedback: str = Field(description="커리큘럼 재생성 시 반영해야 할 구체적인 개선 요청사항")
-    summary: str = Field(description="사용자에게 보여줄 평가 요약 (통과/미통과 이유 포함)")
+    summary: str = Field(description="사용자에게 보여줄 평가 요약")
 
 
 # 인증 요청/응답

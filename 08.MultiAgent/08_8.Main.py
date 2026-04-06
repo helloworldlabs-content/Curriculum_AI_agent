@@ -119,6 +119,7 @@ def chat(req: ChatRequest, _: str = Depends(verify_token)):
             curriculum=result.get("curriculum"),
             state=OrchestratorState.model_validate(result["state"]),
             active_agent=result["active_agent"],
+            curriculum_validated=result.get("curriculum_validated", True),
         )
     except Exception as error:
         logger.exception("[chat] error: %s", error)
