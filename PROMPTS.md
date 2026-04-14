@@ -323,6 +323,7 @@ Data 폴더 하위에 AXCompass.pdf에 역량 진단 검사 결과의 유형에 
 
 ##### 4-1-1.Streamlit 화면 구성
 
+Streamlit 설정
 ```
 [문제점]
 현재 @03.ax_curriculum_chatbot/ax_curriculum_chatbot.py 는 사용자가 CLI 환경에서 사용해야 하므로 불편한 점이 많음.
@@ -331,6 +332,12 @@ Data 폴더 하위에 AXCompass.pdf에 역량 진단 검사 결과의 유형에 
 커리큘럼 결과도 시각화로 깔끔하게 나올 수 있게 해줘.
 
 [결과물] 05.Streamlit 폴더 하위에 05-1.Streamlit.py로 만들어줘.
+```
+
+Advanced_RAG
+```
+@04.RAG/04.RAG.py를 기능별로  05_2.Schemas,05_3.Auth,05_4.Indexing,05_5.Retrieval,05_6.Main,05_7.Dockerfile 파일을 구분하여 도커로 배포하고싶어. 
+@05_Advanced_RAG 폴더에 생성해줘.
 ```
 
 ##### 4-1-2.Docker 배포 실습
